@@ -1,5 +1,10 @@
 TCP 非阻塞伺服器
 ---
+專案配置:
+   - Client端: src/AsioConnFlow.cpp
+   - Server端: server/AsioServer.cpp
+
+
 目前功能:
 
   - 5,000 並發連線穩定 (所有 client 成功連線並進入循環)
