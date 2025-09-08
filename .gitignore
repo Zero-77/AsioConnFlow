@@ -3,6 +3,13 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
+#TLS 私鑰
+certs/private/*.key
+
+# 憑證簽署請求（非必要）
+certs/csr/*.csr
+
+
 # User-specific files
 *.rsuser
 *.suo
