@@ -1,0 +1,191 @@
+﻿#include <boost/asio.hpp>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <functional>
+#include <chrono> //記錄時間
+
+using boost::asio::ip::tcp;
+
+
+// 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
+class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
+public:
+    // 建構子：初始化 socket、計時器、client 編號與目標端點
+    SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint)
+        : socket_(io), timer_(io), id_(id), endpoint_(endpoint), io_(io) {
+    }
+
+    // 啟動 client：非同步連線至 server
+    void start() {
+        socket_.async_connect(endpoint_,
+            std::bind(&SimulatedClient::handle_connect, shared_from_this(),
+                std::placeholders::_1));
+    }
+
+private:
+    // 連線成功後送出 ID，失敗則輸出錯誤訊息
+    void handle_connect(const boost::system::error_code& ec) {
+        if (!ec) {
+            send_id(); // 成功連線並傳送 ID
+        }
+        else {
+            std::cerr << "Client " << id_ << " failed to connect: " << ec.message() << "\n";
+        }
+    }
+
+    // 傳送 ID 訊息給 server（格式：ID:<編號>\n）
+    void send_id() {
+        std::string id_msg = "ID:" + std::to_string(id_) + "\n";
+        boost::asio::async_write(socket_, boost::asio::buffer(id_msg),
+            std::bind(&SimulatedClient::handle_id_sent, shared_from_this(),
+                std::placeholders::_1, std::placeholders::_2));
+    }
+
+    // 等待 server 回覆 ID，收到後啟動訊息循環
+    void handle_id_sent(const boost::system::error_code& ec, std::size_t /*length*/) {
+        auto self(shared_from_this());
+        if (!ec) {
+            socket_.async_read_some(boost::asio::buffer(reply_buffer),
+                [self](boost::system::error_code ec, std::size_t length) {
+                    if (!ec) {
+                        // 印出 server 回覆的 ID 驗證結果
+                        std::string reply(self->reply_buffer.data(), length);
+                        std::cout << "Client " << self->id_ << " received ID reply: " << reply << std::endl;
+
+                        self->schedule_message(); // 啟動訊息循環
+                    }
+                });
+        }
+        else {
+            std::cerr << "Client " << id_ << " failed to send ID: " << ec.message() << "\n";
+        }
+    }
+
+    // 排程訊息傳送（固定間隔 5ms）
+    void schedule_message() {
+        timer_.expires_after(std::chrono::milliseconds(5)); // 控制 QPS
+        //可調整成1000(ms);每秒 1 次（即 1 msg/sec），5,000 個 clients 同時可達總共 5,000 QPS
+        auto self = shared_from_this(); //  確保物件在 callback 存活
+        timer_.async_wait([self](const boost::system::error_code& ec) {
+            if (!ec) {
+                self->send_message();
+            }
+            });
+    }
+
+    // 傳送訊息給 server（格式：Hello from client <id>\n）
+    void send_message() {
+        auto self = shared_from_this();
+        std::string msg = "Hello from client " + std::to_string(id_) + "\n";
+
+        send_time_ = std::chrono::steady_clock::now(); // 記錄送出時間
+
+        boost::asio::async_write(socket_, boost::asio::buffer(msg),
+            [self](boost::system::error_code ec, std::size_t /*length*/) {
+                if (!ec) {
+                    // 等待 server 回覆 Echo 結果
+                    self->socket_.async_read_some(boost::asio::buffer(self->reply_buffer),
+                        [self](boost::system::error_code ec, std::size_t length) {
+                            if (!ec) {
+                                // 印出 server 回覆的 Echo 結果
+                                 //std::string reply(self->reply_buffer.data(), length);
+                                // std::cout << "Client " << self->id_ << " received: " << reply << std::endl;
+
+                                auto end_time = std::chrono::steady_clock::now(); // 記錄回應時間
+                                auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - self->send_time_).count();
+                                self->latency_samples_.push_back(static_cast<int>(duration_us)); // 儲存 latency
+
+                                // 每 1,000 筆輸出一次平均 latency
+                                if (self->latency_samples_.size() >= 500) {
+                                    int total = 0;
+                                    for (int v : self->latency_samples_) total += v;
+                                    int avg = total / static_cast<int>(self->latency_samples_.size());
+                                    std::cout << "Client " << self->id_ << " avg latency: " << avg << "us over " << self->latency_samples_.size() << " samples\n";
+                                    self->latency_samples_.clear();
+                                }
+
+                                self->schedule_message(); // 繼續下一輪，排程下一次訊息形成持續循環
+                            }
+                        });
+                }
+            });
+    }
+
+    int id_;                                                         // client 編號
+    tcp::socket socket_;                                // 與 server 的 TCP socket
+    tcp::endpoint endpoint_;                        // server 的 IP 與 port
+    boost::asio::steady_timer timer_;           // 控制訊息間隔的計時器
+    boost::asio::io_context& io_;                   // 事件迴圈
+    std::array<char, 1024> reply_buffer;     // 接收 server 回覆的緩衝區
+    std::chrono::steady_clock::time_point send_time_; // 記錄每筆訊息的送出時間
+    std::vector<int> latency_samples_;                // 儲存每筆回應的耗時（微秒）
+
+};
+
+// 批次啟動器：用來分批啟動大量 client，避免瞬間爆量
+class BatchLauncher : public std::enable_shared_from_this<BatchLauncher> {
+public:
+    BatchLauncher(boost::asio::io_context& io, tcp::endpoint endpoint,
+        int total_clients, int batch_size, int interval_ms)
+        : io_(io), endpoint_(endpoint), total_clients_(total_clients),
+        batch_size_(batch_size), interval_ms_(interval_ms),
+        launched_(0), timer_(io) {
+    }
+
+    void start() {
+        launch_batch(); // 啟動第一批 client
+    }
+
+private:
+    // 啟動一批 client，並排程下一批
+    void launch_batch() {
+        for (int i = 0; i < batch_size_ && launched_ < total_clients_; i++) {
+            std::make_shared<SimulatedClient>(io_, launched_, endpoint_)->start();
+            launched_++;
+        }
+
+        // 若尚有 client 未啟動，排程下一批
+        if (launched_ < total_clients_) {
+            timer_.expires_after(std::chrono::milliseconds(interval_ms_));
+            timer_.async_wait(std::bind(&BatchLauncher::handle_timer, shared_from_this(),
+                std::placeholders::_1));
+        }
+    }
+
+    // 計時器觸發，啟動下一批 client
+    void handle_timer(const boost::system::error_code& ec) {
+        if (!ec) {
+            launch_batch();
+        }
+    }
+
+
+    int total_clients_;     // 總共要啟動的 client 數量
+    int batch_size_;        // 每批啟動的 client 數量
+    int interval_ms_;       // 每批間隔時間（毫秒）
+    int launched_;          // 已啟動的 client 數量
+    tcp::endpoint endpoint_;
+    boost::asio::io_context& io_;
+    boost::asio::steady_timer timer_; // 控制批次間隔的計時器
+};
+
+int main() {
+    std::srand(static_cast<unsigned int>(std::time(nullptr))); // 初始化隨機種子
+
+    boost::asio::io_context io;
+    tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 12345); // server 端點
+
+    // 模擬參數：可依壓測目標調整
+    int total_clients = 5000;   // 總 client 數
+    int batch_size = 500;       // 每批啟動數量
+    int interval_ms = 100;      // 每批間隔時間（毫秒）
+
+    // 啟動批次啟動器
+    std::make_shared<BatchLauncher>(io, endpoint, total_clients, batch_size, interval_ms)->start();
+    io.run(); // 啟動事件迴圈
+
+    return 0;
+}
