@@ -171,7 +171,7 @@ int main() {
         /*unsigned int thread_count = std::thread::hardware_concurrency();*/
         unsigned int thread_count = 8;
         std::vector<std::thread> threads;
-        for (unsigned int i = 0; i < thread_count; ++i) {
+        for (unsigned int i = 0; i < thread_count; i++) {
             threads.emplace_back([&io]() { io.run(); });
         }
         for (auto& t : threads) t.join();
