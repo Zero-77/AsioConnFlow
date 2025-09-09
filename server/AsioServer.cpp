@@ -19,6 +19,8 @@ std::atomic<int> active_connections{ 0 };
 std::atomic<int> messages_processed{ 0 };
 std::atomic<int> rejected_connections{ 0 };
 
+std::atomic<int> active_tls_connections{ 0 };
+
 std::vector<int> latency_samples;    //儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   //保護 latency_samples 的存取
 
@@ -31,17 +33,17 @@ public:
     }
     */
     Session(boost::asio::io_context& io_context, boost::asio::ssl::context& ssl_ctx)
-        : ssl_stream_(io_context, ssl_ctx)
-    {
-        active_connections++;  // 新連線建立時，活躍連線數加一
+        : ssl_stream_(io_context, ssl_ctx){ 
     }
     
     boost::asio::ssl::stream<tcp::socket>& stream() {
         return ssl_stream_;
     }
 
+    // 連線數加減會是個問題，甚麼時候算是成功/失敗 要確認
     ~Session() {
-        active_connections--; // 連線結束時，活躍連線數減一
+        //active_connections--; // 連線結束時，活躍連線數減一
+        active_tls_connections--; //連線結束時，TLS活躍連線數減一
     }
 
     void start() {
@@ -49,6 +51,7 @@ public:
         ssl_stream_.async_handshake(boost::asio::ssl::stream_base::server,
             [self](const boost::system::error_code& ec) {
                 if (!ec) {
+                    active_tls_connections++;  // 新連線建立時，TLS活躍連線數加一
                     self->do_read();  // 握手成功後進入讀寫循環
                 }
                 else {
@@ -156,8 +159,13 @@ private:
                         latency_samples.clear(); // 每秒清空，避免累積
                     }
                 }
-
+                /*
                 std::cout << "[Server] Active connections: " << active_connections
+                    << " | Messages processed: " << messages_processed
+                    << " | Rejected: " << rejected_connections
+                    << " | Avg latency: " << avg_latency << "us\n";
+                */
+                std::cout << "[Server] Active TLS connections: " << active_tls_connections
                     << " | Messages processed: " << messages_processed
                     << " | Rejected: " << rejected_connections
                     << " | Avg latency: " << avg_latency << "us\n";
@@ -198,8 +206,8 @@ int main() {
         //TLS 1.3 boost
         //建立TLS context
         boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_server);
-        ssl_ctx.use_certificate_chain_file("certs/public/server.crt");
-        ssl_ctx.use_private_key_file("certs/private/server.key", boost::asio::ssl::context::pem);
+        ssl_ctx.use_certificate_chain_file("../../../certs/public/server.crt");
+        ssl_ctx.use_private_key_file("../../../certs/private/server.key", boost::asio::ssl::context::pem);
         
         tcp::endpoint endpoint(tcp::v4(), 12345);
         Server server(io, endpoint, ssl_ctx);

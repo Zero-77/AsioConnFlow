@@ -1,4 +1,5 @@
 ﻿#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -13,16 +14,37 @@ using boost::asio::ip::tcp;
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
 class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
 public:
-    // 建構子：初始化 socket、計時器、client 編號與目標端點
-    SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint)
-        : socket_(io), timer_(io), id_(id), endpoint_(endpoint), io_(io) {
+    // 建構子：初始化 socket、計時器、client 編號與目標端點，加入TLS
+    SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx)
+        : ssl_stream_(io, ssl_ctx), timer_(io), id_(id), endpoint_(endpoint), io_(io) {
     }
 
     // 啟動 client：非同步連線至 server
     void start() {
+        /*
         socket_.async_connect(endpoint_,
             std::bind(&SimulatedClient::handle_connect, shared_from_this(),
                 std::placeholders::_1));
+        */
+
+        //ssl_stream_連線與handshake握手流程
+        auto self = shared_from_this();
+        ssl_stream_.lowest_layer().async_connect(endpoint_, [self](boost::system::error_code ec) {
+            if (!ec) {
+                self->ssl_stream_.async_handshake(boost::asio::ssl::stream_base::client, [self](boost::system::error_code ec) {
+                    if (!ec) {
+                        self->handle_connect(ec);
+                    }
+                    else {
+                        std::cerr << "TLS handshake failed: " << ec.message() << "\n";
+                    }
+                });
+            }
+            else {
+                std::cerr << "Connect failed: " << ec.message() << "\n";
+            }
+
+        });
     }
 
 private:
@@ -39,7 +61,7 @@ private:
     // 傳送 ID 訊息給 server（格式：ID:<編號>\n）
     void send_id() {
         std::string id_msg = "ID:" + std::to_string(id_) + "\n";
-        boost::asio::async_write(socket_, boost::asio::buffer(id_msg),
+        boost::asio::async_write(ssl_stream_, boost::asio::buffer(id_msg),
             std::bind(&SimulatedClient::handle_id_sent, shared_from_this(),
                 std::placeholders::_1, std::placeholders::_2));
     }
@@ -48,7 +70,7 @@ private:
     void handle_id_sent(const boost::system::error_code& ec, std::size_t /*length*/) {
         auto self(shared_from_this());
         if (!ec) {
-            socket_.async_read_some(boost::asio::buffer(reply_buffer),
+            ssl_stream_.async_read_some(boost::asio::buffer(reply_buffer),
                 [self](boost::system::error_code ec, std::size_t length) {
                     if (!ec) {
                         // 印出 server 回覆的 ID 驗證結果
@@ -83,11 +105,11 @@ private:
 
         send_time_ = std::chrono::steady_clock::now(); // 記錄送出時間
 
-        boost::asio::async_write(socket_, boost::asio::buffer(msg),
+        boost::asio::async_write(ssl_stream_, boost::asio::buffer(msg),
             [self](boost::system::error_code ec, std::size_t /*length*/) {
                 if (!ec) {
                     // 等待 server 回覆 Echo 結果
-                    self->socket_.async_read_some(boost::asio::buffer(self->reply_buffer),
+                    self->ssl_stream_.async_read_some(boost::asio::buffer(self->reply_buffer),
                         [self](boost::system::error_code ec, std::size_t length) {
                             if (!ec) {
                                 // 印出 server 回覆的 Echo 結果
@@ -98,8 +120,8 @@ private:
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - self->send_time_).count();
                                 self->latency_samples_.push_back(static_cast<int>(duration_us)); // 儲存 latency
 
-                                // 每 1,000 筆輸出一次平均 latency
-                                if (self->latency_samples_.size() >= 500) {
+                                // 每 100 筆輸出一次平均 latency
+                                if (self->latency_samples_.size() >= 100) {
                                     int total = 0;
                                     for (int v : self->latency_samples_) total += v;
                                     int avg = total / static_cast<int>(self->latency_samples_.size());
@@ -115,22 +137,23 @@ private:
     }
 
     int id_;                                                         // client 編號
-    tcp::socket socket_;                                // 與 server 的 TCP socket
+    //tcp::socket socket_;                                // 與 server 的 TCP socket
     tcp::endpoint endpoint_;                        // server 的 IP 與 port
     boost::asio::steady_timer timer_;           // 控制訊息間隔的計時器
     boost::asio::io_context& io_;                   // 事件迴圈
     std::array<char, 1024> reply_buffer;     // 接收 server 回覆的緩衝區
     std::chrono::steady_clock::time_point send_time_; // 記錄每筆訊息的送出時間
     std::vector<int> latency_samples_;                // 儲存每筆回應的耗時（微秒）
+    boost::asio::ssl::stream<tcp::socket> ssl_stream_;
 
 };
 
 // 批次啟動器：用來分批啟動大量 client，避免瞬間爆量
 class BatchLauncher : public std::enable_shared_from_this<BatchLauncher> {
 public:
-    BatchLauncher(boost::asio::io_context& io, tcp::endpoint endpoint,
+    BatchLauncher(boost::asio::io_context& io, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx,
         int total_clients, int batch_size, int interval_ms)
-        : io_(io), endpoint_(endpoint), total_clients_(total_clients),
+        : io_(io), endpoint_(endpoint), ssl_ctx_(ssl_ctx), total_clients_(total_clients),
         batch_size_(batch_size), interval_ms_(interval_ms),
         launched_(0), timer_(io) {
     }
@@ -143,7 +166,7 @@ private:
     // 啟動一批 client，並排程下一批
     void launch_batch() {
         for (int i = 0; i < batch_size_ && launched_ < total_clients_; i++) {
-            std::make_shared<SimulatedClient>(io_, launched_, endpoint_)->start();
+            std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_)->start();
             launched_++;
         }
 
@@ -170,6 +193,7 @@ private:
     tcp::endpoint endpoint_;
     boost::asio::io_context& io_;
     boost::asio::steady_timer timer_; // 控制批次間隔的計時器
+    boost::asio::ssl::context& ssl_ctx_;
 };
 
 int main() {
@@ -178,13 +202,18 @@ int main() {
     boost::asio::io_context io;
     tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 12345); // server 端點
 
+    //TLS 1.3 boost
+    //建立TLS context
+    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
+    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none); //測試用，不驗證對方，直接接受任何憑證
+
     // 模擬參數：可依壓測目標調整
     int total_clients = 5000;   // 總 client 數
     int batch_size = 500;       // 每批啟動數量
     int interval_ms = 100;      // 每批間隔時間（毫秒）
 
     // 啟動批次啟動器
-    std::make_shared<BatchLauncher>(io, endpoint, total_clients, batch_size, interval_ms)->start();
+    std::make_shared<BatchLauncher>(io, endpoint, ssl_ctx, total_clients, batch_size, interval_ms)->start();
     io.run(); // 啟動事件迴圈
 
     return 0;
