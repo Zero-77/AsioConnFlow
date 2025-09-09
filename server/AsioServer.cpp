@@ -15,23 +15,24 @@ using boost::asio::ip::tcp;
 constexpr int MAX_CONNECTIONS = 5000;
 
 // 全域統計變數：追蹤活躍連線、處理訊息數、拒絕連線數
-std::atomic<int> active_connections{ 0 };
+std::atomic<int> total_connections{ 0 };
 std::atomic<int> messages_processed{ 0 };
 std::atomic<int> rejected_connections{ 0 };
 
+std::atomic<int> active_tcp_connections{ 0 };
 std::atomic<int> active_tls_connections{ 0 };
 
 std::vector<int> latency_samples;    //儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   //保護 latency_samples 的存取
 
+
 // Session 類別：代表一個 client 連線，負責處理讀寫
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    /*
-    Session(tcp::socket socket) : socket_(std::move(socket)) {
-        active_connections++;  // 新連線建立時，活躍連線數加一
+    
+    Session(tcp::socket socket, boost::asio::ssl::context& ctx) : ssl_stream_(std::move(socket), ctx) {
     }
-    */
+    
     Session(boost::asio::io_context& io_context, boost::asio::ssl::context& ssl_ctx)
         : ssl_stream_(io_context, ssl_ctx){ 
     }
@@ -42,23 +43,41 @@ public:
 
     // 連線數加減會是個問題，甚麼時候算是成功/失敗 要確認
     ~Session() {
-        //active_connections--; // 連線結束時，活躍連線數減一
-        active_tls_connections--; //連線結束時，TLS活躍連線數減一
+        if (armed_tcp_) active_tcp_connections--;
+        if (armed_tls_) active_tls_connections--;
     }
 
     void start() {
+
+        armed_tcp_ = true;
+        active_tcp_connections++;  // 新連線建立時，TCP活躍連線數加一
+
         auto self = shared_from_this();
         ssl_stream_.async_handshake(boost::asio::ssl::stream_base::server,
             [self](const boost::system::error_code& ec) {
                 if (!ec) {
+                    self->handshake_ok_ = true;
+                    self->armed_tls_ = true;
                     active_tls_connections++;  // 新連線建立時，TLS活躍連線數加一
                     self->do_read();  // 握手成功後進入讀寫循環
                 }
                 else {
-                    std::cerr << "Handshake failed: " << ec.message() << "\n";
+                    std::cerr << "[Server] TLS handshake failed: " << ec.message() << "\n";
+                    self->graceful_close(); // 握手失敗仍需關閉 socket
                 }
             });
         // do_read(); // 啟動讀取流程
+    }
+
+    void graceful_close() {
+        boost::system::error_code ec;
+
+        if (handshake_ok_) {
+            ssl_stream_.shutdown(ec); // 嘗試送出 close_notify
+        }
+
+        ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+        ssl_stream_.lowest_layer().close(ec);
     }
 
 private:
@@ -98,6 +117,10 @@ private:
     enum { max_length = 1024 };
     char data_[max_length];     // 接收緩衝區
     boost::asio::ssl::stream<tcp::socket> ssl_stream_;
+
+    bool handshake_ok_ = false;       // 握手是否成功
+    bool armed_tcp_ = false;          // 是否已加 active_tcp_connections
+    bool armed_tls_ = false;          // 是否已加 active_tls_connections
 };
 
 // Server 類別：負責監聽、接受連線、統計與關閉流程
@@ -121,21 +144,27 @@ private:
         auto& socket = session->stream().lowest_layer(); // 取得底層 TCP socket
 
         acceptor_.async_accept(socket,
-            [this, session, &socket](boost::system::error_code ec) {
+            [this, session](boost::system::error_code ec) {
                 if (!ec) {
-                    if (active_connections.load() >= MAX_CONNECTIONS) {
+                    total_connections++; //統計所有連線嘗試（不論是否成功握手)
+
+                    if (active_tls_connections.load() >= MAX_CONNECTIONS) {
                         // 超過最大連線數 ，主動關閉 socket
                         boost::system::error_code close_ec;
-                        socket.close(close_ec); // 拒絕超過上限的連線
+                        session->stream().lowest_layer().close(close_ec); // 拒絕超過上限的連線
+                        std::cout << "[Server] Connection rejected (limit reached)\n";
                         rejected_connections++;
                     }
                     else {
                         // 建立 Session 處理該連線
-                        //std::make_shared<Session>(std::move(*new_socket))->start();
+                       // 啟動 TLS session
                         session->start();
                     }
                 }
-                start_accept(); // 無條件遞迴呼叫，確保持續接受連線
+                else {
+                    std::cerr << "[Server] Accept failed: " << ec.message() << "\n";
+                }
+                start_accept(); // 無條件遞迴呼叫，持續接受下一條連線
             });
     }
 
@@ -166,6 +195,8 @@ private:
                     << " | Avg latency: " << avg_latency << "us\n";
                 */
                 std::cout << "[Server] Active TLS connections: " << active_tls_connections
+                    << " | Active TCP connections: " << active_tcp_connections
+                    << " | Total connections: " << total_connections
                     << " | Messages processed: " << messages_processed
                     << " | Rejected: " << rejected_connections
                     << " | Avg latency: " << avg_latency << "us\n";

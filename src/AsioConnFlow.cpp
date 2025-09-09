@@ -11,6 +11,7 @@
 using boost::asio::ip::tcp;
 
 
+
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
 class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
 public:
@@ -33,18 +34,47 @@ public:
             if (!ec) {
                 self->ssl_stream_.async_handshake(boost::asio::ssl::stream_base::client, [self](boost::system::error_code ec) {
                     if (!ec) {
+                        self->handshake_ok_ = true;
                         self->handle_connect(ec);
                     }
                     else {
-                        std::cerr << "TLS handshake failed: " << ec.message() << "\n";
+                        std::cerr << "[Client] TLS handshake failed: " << ec.message() << "\n";
+                        self->graceful_close(); // 握手失敗仍需關閉 socket
                     }
                 });
             }
             else {
                 std::cerr << "Connect failed: " << ec.message() << "\n";
+                return;
             }
 
         });
+    }
+
+    void graceful_close() {
+        // 防止重入
+        if (closing_.exchange(true)) return;
+
+        // 停止未來排程
+        boost::system::error_code ignore_ec;
+        timer_.cancel();
+
+        auto self = shared_from_this();
+        if (handshake_ok_) {
+            //  TLS 關閉：先 async_shutdown()（送出 close_notify）
+            ssl_stream_.async_shutdown([self](const boost::system::error_code& /*ec*/) {
+                // 無論成功與否，都關閉 TCP 層
+                boost::system::error_code ec2;
+                self->ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec2);
+                self->ssl_stream_.lowest_layer().close(ec2);
+                });
+        }
+        else {
+            // 未完成握手，直接關閉 TCP
+            boost::system::error_code ec2;
+            ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec2);
+            ssl_stream_.lowest_layer().close(ec2);
+        }
     }
 
 private:
@@ -60,10 +90,27 @@ private:
 
     // 傳送 ID 訊息給 server（格式：ID:<編號>\n）
     void send_id() {
+        /*
         std::string id_msg = "ID:" + std::to_string(id_) + "\n";
         boost::asio::async_write(ssl_stream_, boost::asio::buffer(id_msg),
             std::bind(&SimulatedClient::handle_id_sent, shared_from_this(),
                 std::placeholders::_1, std::placeholders::_2));
+         */
+
+        //非同步寫入需要持有 buffer 直到完成
+        std::string id_msg = "ID:" + std::to_string(id_) + "\n";
+
+        auto self = shared_from_this();
+        boost::asio::async_write(ssl_stream_, boost::asio::buffer(id_msg),
+            [self](const boost::system::error_code& ec, std::size_t length) {
+                if (!ec) {
+                    self->handle_id_sent(ec, length);
+                }
+                else {
+                    std::cerr << "Client " << self->id_ << " failed to send ID: " << ec.message() << "\n";
+                    self->graceful_close();
+                }
+            });
     }
 
     // 等待 server 回覆 ID，收到後啟動訊息循環
@@ -131,6 +178,10 @@ private:
 
                                 self->schedule_message(); // 繼續下一輪，排程下一次訊息形成持續循環
                             }
+                            else {
+                                std::cerr << "[Client] Write failed: " << ec.message() << "\n";
+                                self->graceful_close();
+                            }
                         });
                 }
             });
@@ -145,6 +196,12 @@ private:
     std::chrono::steady_clock::time_point send_time_; // 記錄每筆訊息的送出時間
     std::vector<int> latency_samples_;                // 儲存每筆回應的耗時（微秒）
     boost::asio::ssl::stream<tcp::socket> ssl_stream_;
+
+    bool handshake_ok_ = false;       // 握手是否成功
+    bool armed_tcp_ = false;          // 是否已加 active_tcp_connections
+    bool armed_tls_ = false;          // 是否已加 active_tls_connections
+
+    std::atomic<bool> closing_{ false };                     // 防止重入關閉
 
 };
 
