@@ -10,26 +10,48 @@
 
 using boost::asio::ip::tcp;
 
+enum class ClientMode {
+    Normal,
+    EarlyClose,
+    Idle,
+    RST,
+    NoTLS
+};
+ClientMode mode_;
 
+BOOLEAN behavior_test = FALSE; //模擬連線行為開關
 
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
 class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
 public:
     // 建構子：初始化 socket、計時器、client 編號與目標端點，加入TLS
-    SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx)
-        : ssl_stream_(io, ssl_ctx), timer_(io), id_(id), endpoint_(endpoint), io_(io) {
+    SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx, ClientMode mode)
+        : ssl_stream_(io, ssl_ctx), plain_socket_(io), timer_(io),
+        id_(id), endpoint_(endpoint), io_(io), mode_(mode) {
     }
+
+
 
     // 啟動 client：非同步連線至 server
     void start() {
-        /*
-        socket_.async_connect(endpoint_,
-            std::bind(&SimulatedClient::handle_connect, shared_from_this(),
-                std::placeholders::_1));
-        */
 
         //ssl_stream_連線與handshake握手流程
         auto self = shared_from_this();
+
+        if (mode_ == ClientMode::NoTLS) {
+            // 使用明文 TCP socket 傳送資料給 TLS server
+            plain_socket_.async_connect(endpoint_, [self](boost::system::error_code ec) {
+                if (!ec) {
+                    std::string msg = "PLAIN:" + std::to_string(self->id_) + "\n";
+                    boost::asio::async_write(self->plain_socket_, boost::asio::buffer(msg),
+                        [self](boost::system::error_code, std::size_t) {
+                            self->plain_socket_.close(); // 傳完就關閉
+                        });
+                }
+                });
+            return;
+        }
+
         ssl_stream_.lowest_layer().async_connect(endpoint_, [self](boost::system::error_code ec) {
             if (!ec) {
                 self->ssl_stream_.async_handshake(boost::asio::ssl::stream_base::client, [self](boost::system::error_code ec) {
@@ -90,12 +112,7 @@ private:
 
     // 傳送 ID 訊息給 server（格式：ID:<編號>\n）
     void send_id() {
-        /*
-        std::string id_msg = "ID:" + std::to_string(id_) + "\n";
-        boost::asio::async_write(ssl_stream_, boost::asio::buffer(id_msg),
-            std::bind(&SimulatedClient::handle_id_sent, shared_from_this(),
-                std::placeholders::_1, std::placeholders::_2));
-         */
+
 
         //非同步寫入需要持有 buffer 直到完成
         std::string id_msg = "ID:" + std::to_string(id_) + "\n";
@@ -123,6 +140,16 @@ private:
                         // 印出 server 回覆的 ID 驗證結果
                         std::string reply(self->reply_buffer.data(), length);
                         std::cout << "Client " << self->id_ << " received ID reply: " << reply << std::endl;
+
+                        if (self->mode_ == ClientMode::EarlyClose) {
+                            self->ssl_stream_.lowest_layer().close(); //模擬提早關閉
+                            return;
+                        }
+
+
+                        if (self->mode_ == ClientMode::Idle) {
+                            return; //模擬idle client (不傳訊息)
+                        }
 
                         self->schedule_message(); // 啟動訊息循環
                     }
@@ -159,9 +186,11 @@ private:
                     self->ssl_stream_.async_read_some(boost::asio::buffer(self->reply_buffer),
                         [self](boost::system::error_code ec, std::size_t length) {
                             if (!ec) {
-                                // 印出 server 回覆的 Echo 結果
-                                 //std::string reply(self->reply_buffer.data(), length);
-                                // std::cout << "Client " << self->id_ << " received: " << reply << std::endl;
+                                if (self->mode_ == ClientMode::RST) {
+                                    self->ssl_stream_.lowest_layer().close(); // 模擬 RST（強制關閉）
+                                    return;
+                                }
+
 
                                 auto end_time = std::chrono::steady_clock::now(); // 記錄回應時間
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - self->send_time_).count();
@@ -202,6 +231,8 @@ private:
     bool armed_tls_ = false;          // 是否已加 active_tls_connections
 
     std::atomic<bool> closing_{ false };                     // 防止重入關閉
+    ClientMode mode_;
+    tcp::socket plain_socket_;  // 用於 NoTLS 模式
 
 };
 
@@ -222,8 +253,18 @@ public:
 private:
     // 啟動一批 client，並排程下一批
     void launch_batch() {
+        
+        //std::make_shared<SimulatedClient>(io_, launched_, endpoint_)->start();
+
         for (int i = 0; i < batch_size_ && launched_ < total_clients_; i++) {
-            std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_)->start();
+            ClientMode mode = ClientMode::Normal;   //可以設定Client端連線模式Normal、EarlyClose、Idle、RST、NoTLS
+            if(behavior_test == TRUE) {
+                if (launched_ % 10 == 0) mode = ClientMode::EarlyClose;
+                else if (launched_ % 15 == 0) mode = ClientMode::Idle;
+                else if (launched_ % 20 == 0) mode = ClientMode::RST;
+                else if (launched_ % 25 == 0) mode = ClientMode::NoTLS;
+            }
+            std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_, mode)->start();
             launched_++;
         }
 

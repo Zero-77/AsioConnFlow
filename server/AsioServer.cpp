@@ -21,6 +21,7 @@ std::atomic<int> rejected_connections{ 0 };
 
 std::atomic<int> active_tcp_connections{ 0 };
 std::atomic<int> active_tls_connections{ 0 };
+std::atomic<int> TLSHFFFF{ 0 };
 
 std::vector<int> latency_samples;    //儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   //保護 latency_samples 的存取
@@ -56,26 +57,58 @@ public:
         ssl_stream_.async_handshake(boost::asio::ssl::stream_base::server,
             [self](const boost::system::error_code& ec) {
                 if (!ec) {
+                     // 握手成功了，但尚未計入 TLS 連線
+                    // 先確認是否超過上限
+                    if (active_tls_connections.load() >= MAX_CONNECTIONS) {
+                        boost::system::error_code close_ec;
+                        self->stream().lowest_layer().close(close_ec);
+                        std::cout << "[Server] TLS handshake rejected (limit reached)\n";
+                        rejected_connections++;
+                        return; // 直接返回：這個連線不應 armed_tls_，不應計數
+                    }
+
+                    // 真正接受：只有在這裡才 armed + increment
                     self->handshake_ok_ = true;
                     self->armed_tls_ = true;
-                    active_tls_connections++;  // 新連線建立時，TLS活躍連線數加一
-                    self->do_read();  // 握手成功後進入讀寫循環
+                    active_tls_connections++;
+
+                    // 進入讀寫循環
+                    self->do_read();
                 }
                 else {
-                    std::cerr << "[Server] TLS handshake failed: " << ec.message() << "\n";
-                    self->graceful_close(); // 握手失敗仍需關閉 socket
+                    std::string reason = "Unknown";
+
+                    if (ec == boost::asio::error::eof) {
+                        reason = "Client closed connection (EarlyClose)";
+                    }
+                    else if (ec == boost::asio::error::connection_reset) {
+                        reason = "Client sent TCP RST";
+                    }
+                    else if (ec == boost::asio::ssl::error::stream_truncated) {
+                        reason = "Client sent non-TLS data (NoTLS)";
+                    }
+                    else if (ec == boost::asio::error::operation_aborted) {
+                        reason = "Handshake aborted (timeout or shutdown)";
+                    }
+                    else {
+                        reason = "Handshake failed: " + ec.message(); 
+                        //目前NoTLS 模式會印出Handshake failed: packet length too long (SSL routines)
+                    }
+
+                    std::cerr << "[Server] TLS handshake failed: " << reason << "\n"; 
+                    TLSHFFFF++;
+                    self->graceful_close();
                 }
             });
-        // do_read(); // 啟動讀取流程
     }
 
     void graceful_close() {
+        if (closed_.exchange(true)) return; // 防重入
+
         boost::system::error_code ec;
-
         if (handshake_ok_) {
-            ssl_stream_.shutdown(ec); // 嘗試送出 close_notify
+            ssl_stream_.shutdown(ec); // 盡量送 close_notify
         }
-
         ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
         ssl_stream_.lowest_layer().close(ec);
     }
@@ -95,8 +128,8 @@ private:
 
                     // 非同步回寫 Echo 回應
                     boost::asio::async_write(self->ssl_stream_, boost::asio::buffer(response),
-                        [self, start](boost::system::error_code ec, std::size_t /*length*/) {
-                            if (!ec) {
+                        [self, start](boost::system::error_code ec2, std::size_t) {
+                            if (!ec2) {
                                 // 計算處理耗時（微秒）
                                 auto end = std::chrono::steady_clock::now();
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -108,7 +141,13 @@ private:
                                 }
                                 self->do_read(); // 形成讀→寫→讀循環，回寫成功後繼續下一輪讀取
                             }
+                            else {
+                                self->graceful_close(); //確保釋放與計數遞減。
+                            }
                         });
+                }
+                else {
+                    self->graceful_close(); //確保釋放與計數遞減。
                 }
             });
     }
@@ -121,6 +160,7 @@ private:
     bool handshake_ok_ = false;       // 握手是否成功
     bool armed_tcp_ = false;          // 是否已加 active_tcp_connections
     bool armed_tls_ = false;          // 是否已加 active_tls_connections
+    std::atomic<bool> closed_{ false }; //graceful_close 防止多次關閉
 };
 
 // Server 類別：負責監聽、接受連線、統計與關閉流程
@@ -128,10 +168,26 @@ class Server {
 public:
     Server(boost::asio::io_context& io_context, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx)
         : io_context_(io_context),
-        acceptor_(io_context, endpoint),
+        acceptor_(io_context),
         ssl_ctx_(ssl_ctx),
         stats_timer_(io_context),
         signals_(io_context, SIGINT, SIGTERM) {
+
+        // 手動 open/bind/listen
+        boost::system::error_code ec;
+        acceptor_.open(endpoint.protocol(), ec);
+        if (ec) throw std::runtime_error("acceptor open failed: " + ec.message());
+
+        acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec);
+        if (ec) std::cerr << "[Server] set_option(reuse_address) failed: " << ec.message() << "\n";
+
+        acceptor_.bind(endpoint, ec);
+        if (ec) throw std::runtime_error("acceptor bind failed: " + ec.message());
+
+        acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) std::cerr << "[Server] listen failed: " << ec.message() << "\n";
+
+
         start_accept();      // 啟動非同步接受連線
         start_stats();       // 啟動統計計時器
         start_signal_wait(); // 啟動訊號監聽
@@ -146,20 +202,11 @@ private:
         acceptor_.async_accept(socket,
             [this, session](boost::system::error_code ec) {
                 if (!ec) {
-                    total_connections++; //統計所有連線嘗試（不論是否成功握手)
+                    total_connections++; //統計所有連線嘗試(不論是否成功握手)
 
-                    if (active_tls_connections.load() >= MAX_CONNECTIONS) {
-                        // 超過最大連線數 ，主動關閉 socket
-                        boost::system::error_code close_ec;
-                        session->stream().lowest_layer().close(close_ec); // 拒絕超過上限的連線
-                        std::cout << "[Server] Connection rejected (limit reached)\n";
-                        rejected_connections++;
-                    }
-                    else {
-                        // 建立 Session 處理該連線
-                       // 啟動 TLS session
-                        session->start();
-                    }
+                     // 建立 Session 處理該連線，啟動 TLS sessio
+                    session->start();
+
                 }
                 else {
                     std::cerr << "[Server] Accept failed: " << ec.message() << "\n";
