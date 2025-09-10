@@ -21,7 +21,6 @@ std::atomic<int> rejected_connections{ 0 };
 
 std::atomic<int> active_tcp_connections{ 0 };
 std::atomic<int> active_tls_connections{ 0 };
-std::atomic<int> TLSHFFFF{ 0 };
 
 std::vector<int> latency_samples;    //儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   //保護 latency_samples 的存取
@@ -95,8 +94,10 @@ public:
                         //目前NoTLS 模式會印出Handshake failed: packet length too long (SSL routines)
                     }
 
-                    std::cerr << "[Server] TLS handshake failed: " << reason << "\n"; 
-                    TLSHFFFF++;
+                    //std::cerr << "[Server] TLS handshake failed: " << reason << "\n"; 
+
+                    std::cerr << "[Server] TLS handshake failed: " << ec.message() << "\n";
+
                     self->graceful_close();
                 }
             });
@@ -283,10 +284,18 @@ int main() {
 
         //TLS 1.3 boost
         //建立TLS context
+        
         boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_server);
+        //1. 載入Server的憑證與私鑰
         ssl_ctx.use_certificate_chain_file("../../../certs/public/server.crt");
         ssl_ctx.use_private_key_file("../../../certs/private/server.key", boost::asio::ssl::context::pem);
+
+        //2. 設定驗證模式:要求client提供憑證，並強制驗證
+        ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
         
+        // 3. 載入 CA 憑證：用來驗證 client 的憑證是否由信任的 CA 簽發
+        ssl_ctx.load_verify_file("../../../CA/ca.pem");
+
         tcp::endpoint endpoint(tcp::v4(), 12345);
         Server server(io, endpoint, ssl_ctx);
 
