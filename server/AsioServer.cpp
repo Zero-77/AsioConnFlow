@@ -12,7 +12,7 @@
 using boost::asio::ip::tcp;
 
 // 提高最大連線數以符合壓測目標
-constexpr int MAX_CONNECTIONS = 5000;
+constexpr int MAX_CONNECTIONS = 10000;
 
 // 全域統計變數：追蹤活躍連線、處理訊息數、拒絕連線數
 std::atomic<int> total_connections{ 0 };
@@ -287,8 +287,8 @@ int main() {
         
         boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_server);
         //1. 載入Server的憑證與私鑰
-        ssl_ctx.use_certificate_chain_file("../../../certs/public/server.crt");
-        ssl_ctx.use_private_key_file("../../../certs/private/server.key", boost::asio::ssl::context::pem);
+        ssl_ctx.use_certificate_chain_file("../../../server-certs/public/server.crt");
+        ssl_ctx.use_private_key_file("../../../server-certs/private/server.key", boost::asio::ssl::context::pem);
 
         //2. 設定驗證模式:要求client提供憑證，並強制驗證
         ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);

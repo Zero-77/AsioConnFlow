@@ -7,6 +7,7 @@
 #include <ctime>
 #include <functional>
 #include <chrono> //記錄時間
+#include <random>
 
 using boost::asio::ip::tcp;
 
@@ -19,24 +20,89 @@ enum class ClientMode {
 };
 ClientMode mode_;
 
+
+struct RetryPolicy {
+    int max_attempts = 5;
+    int base_delay_ms = 500;
+
+    bool should_retry(const boost::system::error_code& ec) const {
+        std::string msg = ec.message();
+        return !(msg.find("certificate verify failed") != std::string::npos ||
+            msg.find("unknown ca") != std::string::npos ||
+            msg.find("expired") != std::string::npos);
+    }
+
+    int delay_for(int attempt, std::mt19937& rng) const {
+        int base = base_delay_ms * (1 << attempt); // exponential backoff
+        int jitter = rand() % 200;                 // random jitter
+        return base + jitter;
+    }
+};
+
+
 BOOLEAN behavior_test = FALSE; //模擬連線行為開關
 
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
 class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
 public:
     // 建構子：初始化 socket、計時器、client 編號與目標端點，加入TLS
+    /*
     SimulatedClient(boost::asio::io_context& io, int id, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx, ClientMode mode)
         : ssl_stream_(io, ssl_ctx), plain_socket_(io), timer_(io),
-        id_(id), endpoint_(endpoint), io_(io), mode_(mode) {
-    }
+        id_(id), endpoint_(endpoint), io_(io), mode_(mode)
+    {
 
+    }
+    */
+    SimulatedClient(boost::asio::io_context& io,
+        int id,
+        tcp::endpoint endpoint,
+        boost::asio::ssl::context& ssl_ctx,
+        ClientMode mode,
+        std::string sni_host = "localhost",
+        RetryPolicy retry_policy = {})
+        : ssl_stream_(io, ssl_ctx),
+        plain_socket_(io),
+        timer_(io),
+        id_(id),
+        endpoint_(std::move(endpoint)),
+        io_(io),
+        ssl_context_(ssl_ctx),
+        mode_(mode),
+        sni_host_(std::move(sni_host)),
+        retry_policy_(std::move(retry_policy)),
+        rng_(std::random_device{}())
+    { }
 
 
     // 啟動 client：非同步連線至 server
     void start() {
 
+        //主機名驗證(SNI + CN / SAN)
+        SSL* ssl = ssl_stream_.native_handle();
+        SSL_set_tlsext_host_name(ssl, "localhost"); //SNI
+        SSL_set1_host(ssl, "localhost");    //主機名驗證(CN/SAN)
+
+
         //ssl_stream_連線與handshake握手流程
         auto self = shared_from_this();
+
+        /*連線模擬一個假錯誤（例如 connect failed），進入retry連線流程
+        *************************
+        // 模擬一個假錯誤（例如 connect failed）
+        boost::system::error_code fake_error = boost::asio::error::connection_refused;
+
+        // 判斷是否應該重試
+        if (retry_policy_.should_retry(fake_error)) {
+            std::cout << "[Client #" << id_ << "] Simulating retry due to: " << fake_error.message() << "\n";
+            schedule_retry(1); // 手動觸發 retry
+        }
+        else {
+            std::cerr << "[Client #" << id_ << "] Simulated fatal error: " << fake_error.message() << "\n";
+            graceful_close();
+        }
+        *************************
+         */
 
         if (mode_ == ClientMode::NoTLS) {
             // 使用明文 TCP socket 傳送資料給 TLS server
@@ -56,12 +122,14 @@ public:
             if (!ec) {
                 self->ssl_stream_.async_handshake(boost::asio::ssl::stream_base::client, [self](boost::system::error_code ec) {
                     if (!ec) {
+                      //*  std::cout << "[Client] TLS handshake success — server verified\n";
                         self->handshake_ok_ = true;
                         self->handle_connect(ec);
                     }
                     else {
                         std::cerr << "[Client] TLS handshake failed: " << ec.message() << "\n";
                         self->graceful_close(); // 握手失敗仍需關閉 socket
+                        return;
                     }
                 });
             }
@@ -72,6 +140,85 @@ public:
 
         });
     }
+
+    void start_with_retry(int attempt = 0) {
+        if (attempt > retry_policy_.max_attempts) {
+            std::cerr << "[Client] Max retry reached. Giving up.\n";
+            return;
+        }
+
+        auto self = shared_from_this();
+        ssl_stream_.lowest_layer().async_connect(endpoint_, [self = shared_from_this(), attempt](boost::system::error_code ec) {
+            if (!ec) {
+                self->ssl_stream_.async_handshake(boost::asio::ssl::stream_base::client, [self, attempt](boost::system::error_code ec) {
+                    if (!ec) {
+                        //* std::cout << "[Client] TLS handshake success\n";
+                        self->handle_connect(ec);
+                    }
+                    else {
+                        std::cerr << "[Client] TLS handshake failed: " << ec.message() << "\n";
+
+                        // 憑證錯誤不重試
+                        if (!self->retry_policy_.should_retry(ec)) {
+                            std::cerr << "[Client] Fatal TLS error, not retrying.\n";
+                            return;
+                        }
+
+                        self->graceful_close();
+                        self->schedule_retry(attempt + 1);
+                    }
+                    });
+            }
+            else {
+                std::cerr << "[Client] Connect failed: " << ec.message() << "\n";
+                self->schedule_retry(attempt + 1);
+            }
+        });
+    }
+
+    void SimulatedClient::schedule_retry(int next_attempt) {
+        const int delay = retry_policy_.delay_for(next_attempt, rng_);
+        std::cout << "[Client] Scheduling retry #" << next_attempt << " in " << delay << "ms\n";
+
+        timer_.expires_after(std::chrono::milliseconds(delay));
+        auto self = shared_from_this();
+        timer_.async_wait([self, next_attempt](boost::system::error_code ec) {
+            if (ec) return;
+            self->reset_connection();
+            self->start_with_retry(next_attempt);
+            });
+    }
+
+    void retry_later(int next_attempt) {
+        auto self = shared_from_this();
+        timer_.expires_after(std::chrono::milliseconds(500 * next_attempt));
+        timer_.async_wait([self, next_attempt](boost::system::error_code) {
+            self->reset_connection();
+            self->start_with_retry(next_attempt);
+        });
+    }
+
+    void SimulatedClient::reset_connection() {
+        boost::system::error_code ec;
+
+        boost::asio::io_context io;
+        //TLS 1.3 boost
+        //建立TLS context
+        boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
+
+        // 關閉舊 socket（若已建立）
+        ssl_stream_.lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+        ssl_stream_.lowest_layer().close(ec);
+
+        // 重新建立 TLS stream（避免 socket 泄漏）
+        ssl_stream_ = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>(io, ssl_ctx);
+
+        // 設定主機名驗證（SNI + CN/SAN）
+        SSL* ssl = ssl_stream_.native_handle();
+        SSL_set_tlsext_host_name(ssl, "localhost");
+        SSL_set1_host(ssl, "localhost");
+    }
+
 
     void graceful_close() {
         // 防止重入
@@ -132,14 +279,14 @@ private:
 
     // 等待 server 回覆 ID，收到後啟動訊息循環
     void handle_id_sent(const boost::system::error_code& ec, std::size_t /*length*/) {
-        auto self(shared_from_this());
+        auto self = shared_from_this();
         if (!ec) {
             ssl_stream_.async_read_some(boost::asio::buffer(reply_buffer),
                 [self](boost::system::error_code ec, std::size_t length) {
                     if (!ec) {
                         // 印出 server 回覆的 ID 驗證結果
                         std::string reply(self->reply_buffer.data(), length);
-                        std::cout << "Client " << self->id_ << " received ID reply: " << reply << std::endl;
+                       //* std::cout << "Client " << self->id_ << " received ID reply: " << reply << std::endl;
 
                         if (self->mode_ == ClientMode::EarlyClose) {
                             self->ssl_stream_.lowest_layer().close(); //模擬提早關閉
@@ -196,12 +343,12 @@ private:
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - self->send_time_).count();
                                 self->latency_samples_.push_back(static_cast<int>(duration_us)); // 儲存 latency
 
-                                // 每 100 筆輸出一次平均 latency
-                                if (self->latency_samples_.size() >= 100) {
+                                // 每 500 筆輸出一次平均 latency
+                                if (self->latency_samples_.size() >= 500) {
                                     int total = 0;
                                     for (int v : self->latency_samples_) total += v;
                                     int avg = total / static_cast<int>(self->latency_samples_.size());
-                                    std::cout << "Client " << self->id_ << " avg latency: " << avg << "us over " << self->latency_samples_.size() << " samples\n";
+                                    //* std::cout << "Client " << self->id_ << " avg latency: " << avg << "us over " << self->latency_samples_.size() << " samples\n";
                                     self->latency_samples_.clear();
                                 }
 
@@ -225,6 +372,7 @@ private:
     std::chrono::steady_clock::time_point send_time_; // 記錄每筆訊息的送出時間
     std::vector<int> latency_samples_;                // 儲存每筆回應的耗時（微秒）
     boost::asio::ssl::stream<tcp::socket> ssl_stream_;
+    boost::asio::ssl::context& ssl_context_;
 
     bool handshake_ok_ = false;       // 握手是否成功
     bool armed_tcp_ = false;          // 是否已加 active_tcp_connections
@@ -233,6 +381,9 @@ private:
     std::atomic<bool> closing_{ false };                     // 防止重入關閉
     ClientMode mode_;
     tcp::socket plain_socket_;  // 用於 NoTLS 模式
+    RetryPolicy retry_policy_;      // 這就是你缺的成員
+    std::mt19937 rng_;              // jitter 用亂數
+    std::string sni_host_;
 
 };
 
@@ -264,7 +415,8 @@ private:
                 else if (launched_ % 20 == 0) mode = ClientMode::RST;
                 else if (launched_ % 25 == 0) mode = ClientMode::NoTLS;
             }
-            std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_, mode)->start();
+            //std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_, mode)->start();
+            std::make_shared<SimulatedClient>(io_, launched_, endpoint_, ssl_ctx_, mode)->start_with_retry();
             launched_++;
         }
 
@@ -303,16 +455,48 @@ int main() {
     //TLS 1.3 boost
     //建立TLS context
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
-    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none); //測試用，不驗證對方，直接接受任何憑證
+    //ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none); //測試用，不驗證對方，直接接受任何憑證
+
+    //1. 驗證 Server憑證(由CA簽發)
+    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+    ssl_ctx.load_verify_file("../../../CA/ca.pem"); // CA憑證: 用來驗證 server.crt
+
+    //2. 提供Client 的憑證與私鑰(由同一CA簽發)
+    ssl_ctx.use_certificate_chain_file("../../../client-certs/public/client.crt");
+    ssl_ctx.use_private_key_file("../../../client-certs/private/client.key", boost::asio::ssl::context::pem);
 
     // 模擬參數：可依壓測目標調整
+    /*
     int total_clients = 5000;   // 總 client 數
     int batch_size = 500;       // 每批啟動數量
     int interval_ms = 100;      // 每批間隔時間（毫秒）
+    */
+
+    int total_clients = 300;   // 總 client 數
+    int batch_size = 100;       // 每批啟動數量
+    int interval_ms = 10000;      // 每批間隔時間（毫秒）
 
     // 啟動批次啟動器
-    std::make_shared<BatchLauncher>(io, endpoint, ssl_ctx, total_clients, batch_size, interval_ms)->start();
+    //std::make_shared<BatchLauncher>(io, endpoint, ssl_ctx, total_clients, batch_size, interval_ms)->start();
+    
+    //發送 瞬間併發連線
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 7700; i++) {
+        threads.emplace_back([&, i]() {
+            auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal);
+            client->start_with_retry();
+            });
+    }
+    for (auto& t : threads) t.join();
+    
     io.run(); // 啟動事件迴圈
+
+    try {
+       io.run();
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[Client] Exception caught: " << e.what() << "\n";
+    }
 
     return 0;
 }
