@@ -1,4 +1,4 @@
-﻿#include <boost/asio.hpp>
+#include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <memory>
@@ -8,6 +8,10 @@
 #include <functional>
 #include <chrono> //記錄時間
 #include <random>
+#include <numeric>
+#include <csignal>
+
+
 
 using boost::asio::ip::tcp;
 
@@ -39,6 +43,24 @@ struct RetryPolicy {
     }
 };
 
+std::atomic<int> qps_counter{ 0 };
+std::atomic<bool> stop_qps_monitor{ false };
+std::atomic<bool> stop_requested{ false };
+
+
+void record_qps(std::atomic<bool>& stop_flag) {
+    std::thread([&]() {
+        while (!stop_flag.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (stop_qps_monitor.load()) break;
+            int qps = qps_counter.exchange(0);
+            std::cout << "[Monitor] QPS: " << qps << "\n";
+        }
+        }).detach();
+}
+
+
+
 
 BOOLEAN behavior_test = FALSE; //模擬連線行為開關
 
@@ -59,8 +81,7 @@ public:
         tcp::endpoint endpoint,
         boost::asio::ssl::context& ssl_ctx,
         ClientMode mode,
-        std::string sni_host = "localhost",
-        RetryPolicy retry_policy = {})
+        std::shared_ptr<std::vector<int>> shared_latencies = nullptr)
         : ssl_stream_(io, ssl_ctx),
         plain_socket_(io),
         timer_(io),
@@ -69,8 +90,7 @@ public:
         io_(io),
         ssl_context_(ssl_ctx),
         mode_(mode),
-        sni_host_(std::move(sni_host)),
-        retry_policy_(std::move(retry_policy)),
+        shared_latencies_(std::move(shared_latencies)),
         rng_(std::random_device{}())
     { }
 
@@ -309,7 +329,7 @@ private:
 
     // 排程訊息傳送（固定間隔 5ms）
     void schedule_message() {
-        timer_.expires_after(std::chrono::milliseconds(5)); // 控制 QPS
+        timer_.expires_after(std::chrono::milliseconds(1000)); // 控制 QPS
         //可調整成1000(ms);每秒 1 次（即 1 msg/sec），5,000 個 clients 同時可達總共 5,000 QPS
         auto self = shared_from_this(); //  確保物件在 callback 存活
         timer_.async_wait([self](const boost::system::error_code& ec) {
@@ -342,6 +362,11 @@ private:
                                 auto end_time = std::chrono::steady_clock::now(); // 記錄回應時間
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - self->send_time_).count();
                                 self->latency_samples_.push_back(static_cast<int>(duration_us)); // 儲存 latency
+                                if (self->shared_latencies_) {
+                                    self->shared_latencies_->push_back(static_cast<int>(duration_us));
+                                }
+
+                                qps_counter++;
 
                                 // 每 500 筆輸出一次平均 latency
                                 if (self->latency_samples_.size() >= 500) {
@@ -381,10 +406,10 @@ private:
     std::atomic<bool> closing_{ false };                     // 防止重入關閉
     ClientMode mode_;
     tcp::socket plain_socket_;  // 用於 NoTLS 模式
-    RetryPolicy retry_policy_;      // 這就是你缺的成員
+    RetryPolicy retry_policy_;
     std::mt19937 rng_;              // jitter 用亂數
     std::string sni_host_;
-
+    std::shared_ptr<std::vector<int>> shared_latencies_;
 };
 
 // 批次啟動器：用來分批啟動大量 client，避免瞬間爆量
@@ -450,6 +475,18 @@ int main() {
     std::srand(static_cast<unsigned int>(std::time(nullptr))); // 初始化隨機種子
 
     boost::asio::io_context io;
+
+
+    // 加入 signal_set 來攔截 Ctrl+C
+    boost::asio::signal_set signals(io, SIGINT);
+    signals.async_wait([&](boost::system::error_code /*ec*/, int /*signo*/) {
+        std::cout << "\n[Client] Ctrl+C detected. Shutting down gracefully...\n";
+        stop_requested.store(true);
+        stop_qps_monitor.store(true);
+        io.stop(); // 這是關鍵，讓 io.run() 結束
+    });
+
+
     tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 12345); // server 端點
 
     //TLS 1.3 boost
@@ -464,6 +501,9 @@ int main() {
     //2. 提供Client 的憑證與私鑰(由同一CA簽發)
     ssl_ctx.use_certificate_chain_file("../../../client-certs/public/client.crt");
     ssl_ctx.use_private_key_file("../../../client-certs/private/client.key", boost::asio::ssl::context::pem);
+
+    //計算
+    auto all_latencies = std::make_shared<std::vector<int>>();
 
     // 模擬參數：可依壓測目標調整
     /*
@@ -483,19 +523,43 @@ int main() {
     std::vector<std::thread> threads;
     for (int i = 0; i < 7700; i++) {
         threads.emplace_back([&, i]() {
-            auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal);
+            auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal, all_latencies);
             client->start_with_retry();
             });
     }
     for (auto& t : threads) t.join();
     
-    io.run(); // 啟動事件迴圈
+    //io.run(); // 啟動事件迴圈
 
+    
+    
     try {
-       io.run();
+
+        record_qps(stop_qps_monitor); // 啟動即時 QPS 顯示
+
+       io.run();  // 啟動事件迴圈
+
+       // 分析 latency 分佈
+       std::sort(all_latencies->begin(), all_latencies->end());
+
+       int total = all_latencies->size();
+       int p95 = all_latencies->at(total * 95 / 100);
+       int p99 = all_latencies->at(total * 99 / 100);
+       double avg = std::accumulate(all_latencies->begin(), all_latencies->end(), 0.0) / total;
+
+       std::cout << "\n=== Performance Summary ===\n";
+       std::cout << "Total Requests: " << total << "\n";
+       std::cout << "Average Latency: " << avg / 1000 << " ms\n";
+       std::cout << "P95 Latency: " << p95 / 1000 << " ms\n";
+       std::cout << "P99 Latency: " << p99 / 1000 << " ms\n";
     }
     catch (const std::exception& e) {
         std::cerr << "[Client] Exception caught: " << e.what() << "\n";
+    }
+
+    if (stop_requested.load()) {
+        std::cout << "[Client] Graceful shutdown complete. Press Enter to exit.\n";
+        std::cin.get();
     }
 
     return 0;

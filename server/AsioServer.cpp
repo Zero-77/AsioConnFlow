@@ -7,41 +7,42 @@
 #include <vector>
 #include <atomic>
 #include <csignal>
-#include <chrono> //°O¿ı®É¶¡
+#include <chrono>
 
 using boost::asio::ip::tcp;
 
-// ´£°ª³Ì¤j³s½u¼Æ¥H²Å¦XÀ£´ú¥Ø¼Ğ
+// æé«˜æœ€å¤§é€£ç·šæ•¸ä»¥ç¬¦åˆå£“æ¸¬ç›®æ¨™
 constexpr int MAX_CONNECTIONS = 10000;
 
-// ¥ş°ì²Î­pÅÜ¼Æ¡G°lÂÜ¬¡ÅD³s½u¡B³B²z°T®§¼Æ¡B©Úµ´³s½u¼Æ
+// å…¨åŸŸçµ±è¨ˆè®Šæ•¸ï¼šè¿½è¹¤ç¸½é€£ç·šæ•¸ã€è™•ç†è¨Šæ¯æ•¸ã€æ‹’çµ•é€£ç·šæ•¸ã€TCPé€£ç·šæ•¸ã€TLSé€£ç·šæ•¸
 std::atomic<int> total_connections{ 0 };
 std::atomic<int> messages_processed{ 0 };
 std::atomic<int> rejected_connections{ 0 };
-
 std::atomic<int> active_tcp_connections{ 0 };
 std::atomic<int> active_tls_connections{ 0 };
 
-std::vector<int> latency_samples;    //Àx¦s¨Cµ§³B²z¯Ó®É¡]·L¬í¡^
-std::mutex latency_mutex;   //«OÅ@ latency_samples ªº¦s¨ú
+// æ•ˆèƒ½çµ±è¨ˆå’Œäº’æ–¥é–
+std::vector<int> latency_samples;    // å„²å­˜æ¯ç­†è™•ç†è€—æ™‚ï¼ˆå¾®ç§’ï¼‰
+std::mutex latency_mutex;   // ä¿è­· latency_samples çš„å­˜å–
 
 
-// Session Ãş§O¡G¥Nªí¤@­Ó client ³s½u¡A­t³d³B²zÅª¼g
+// Session é¡åˆ¥ï¼šä»£è¡¨ä¸€å€‹ client é€£ç·šï¼Œè² è²¬è™•ç†è®€å¯«
 class Session : public std::enable_shared_from_this<Session> {
 public:
     
-    Session(tcp::socket socket, boost::asio::ssl::context& ctx) : ssl_stream_(std::move(socket), ctx) {
+    Session(tcp::socket socket, boost::asio::ssl::context& ctx) 
+        : ssl_stream_(std::move(socket), ctx) {
     }
     
     Session(boost::asio::io_context& io_context, boost::asio::ssl::context& ssl_ctx)
-        : ssl_stream_(io_context, ssl_ctx){ 
+        : ssl_stream_(io_context, ssl_ctx)  { 
     }
     
     boost::asio::ssl::stream<tcp::socket>& stream() {
         return ssl_stream_;
     }
 
-    // ³s½u¼Æ¥[´î·|¬O­Ó°İÃD¡A¬Æ»ò®É­Ôºâ¬O¦¨¥\/¥¢±Ñ ­n½T»{
+    // é€£ç·šæ•¸åŠ æ¸›æœƒæ˜¯å€‹å•é¡Œï¼Œç”šéº¼æ™‚å€™ç®—æ˜¯æˆåŠŸ/å¤±æ•— è¦ç¢ºèª
     ~Session() {
         if (armed_tcp_) active_tcp_connections--;
         if (armed_tls_) active_tls_connections--;
@@ -50,28 +51,28 @@ public:
     void start() {
 
         armed_tcp_ = true;
-        active_tcp_connections++;  // ·s³s½u«Ø¥ß®É¡ATCP¬¡ÅD³s½u¼Æ¥[¤@
+        active_tcp_connections++;  // æ–°é€£ç·šå»ºç«‹æ™‚ï¼ŒTCPæ´»èºé€£ç·šæ•¸åŠ ä¸€
 
         auto self = shared_from_this();
         ssl_stream_.async_handshake(boost::asio::ssl::stream_base::server,
             [self](const boost::system::error_code& ec) {
                 if (!ec) {
-                     // ´¤¤â¦¨¥\¤F¡A¦ı©|¥¼­p¤J TLS ³s½u
-                    // ¥ı½T»{¬O§_¶W¹L¤W­­
+                     // æ¡æ‰‹æˆåŠŸäº†ï¼Œä½†å°šæœªè¨ˆå…¥ TLS é€£ç·š
+                    // å…ˆç¢ºèªæ˜¯å¦è¶…éä¸Šé™
                     if (active_tls_connections.load() >= MAX_CONNECTIONS) {
                         boost::system::error_code close_ec;
                         self->stream().lowest_layer().close(close_ec);
                         std::cout << "[Server] TLS handshake rejected (limit reached)\n";
                         rejected_connections++;
-                        return; // ª½±µªğ¦^¡G³o­Ó³s½u¤£À³ armed_tls_¡A¤£À³­p¼Æ
+                        return; // ç›´æ¥è¿”å›ï¼šé€™å€‹é€£ç·šä¸æ‡‰ armed_tls_ï¼Œä¸æ‡‰è¨ˆæ•¸
                     }
 
-                    // ¯u¥¿±µ¨ü¡G¥u¦³¦b³o¸Ì¤~ armed + increment
+                    // çœŸæ­£æ¥å—ï¼šåªæœ‰åœ¨é€™è£¡æ‰ armed + increment
                     self->handshake_ok_ = true;
                     self->armed_tls_ = true;
                     active_tls_connections++;
 
-                    // ¶i¤JÅª¼g´`Àô
+                    // é€²å…¥è®€å¯«å¾ªç’°
                     self->do_read();
                 }
                 else {
@@ -91,7 +92,7 @@ public:
                     }
                     else {
                         reason = "Handshake failed: " + ec.message(); 
-                        //¥Ø«eNoTLS ¼Ò¦¡·|¦L¥XHandshake failed: packet length too long (SSL routines)
+                        //ç›®å‰NoTLS æ¨¡å¼æœƒå°å‡ºHandshake failed: packet length too long (SSL routines)
                     }
 
                     //std::cerr << "[Server] TLS handshake failed: " << reason << "\n"; 
@@ -104,67 +105,67 @@ public:
     }
 
     void graceful_close() {
-        if (closed_.exchange(true)) return; // ¨¾­«¤J
+        if (closed_.exchange(true)) return; // é˜²é‡å…¥
 
         boost::system::error_code ec;
         if (handshake_ok_) {
-            ssl_stream_.shutdown(ec); // ºÉ¶q°e close_notify
+            ssl_stream_.shutdown(ec); // ç›¡é‡é€ close_notify
         }
         ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
         ssl_stream_.lowest_layer().close(ec);
     }
 
 private:
-    // «D¦P¨BÅª¨ú client ¸ê®Æ
+    // éåŒæ­¥è®€å– client è³‡æ–™
     void do_read() {
         auto self = shared_from_this();
         ssl_stream_.async_read_some(boost::asio::buffer(data_),
             [self](boost::system::error_code ec, std::size_t length) {
                 if (!ec) {
-                    messages_processed++; // ¦¨¥\³B²z¤@µ§°T®§
+                    messages_processed++; // æˆåŠŸè™•ç†ä¸€ç­†è¨Šæ¯
 
-                    auto start = std::chrono::steady_clock::now();  //°O¿ı¶}©l®É¶¡
+                    auto start = std::chrono::steady_clock::now();  //è¨˜éŒ„é–‹å§‹æ™‚é–“
 
                     std::string response = "Echo: " + std::string(self->data_, length);
 
-                    // «D¦P¨B¦^¼g Echo ¦^À³
+                    // éåŒæ­¥å›å¯« Echo å›æ‡‰
                     boost::asio::async_write(self->ssl_stream_, boost::asio::buffer(response),
                         [self, start](boost::system::error_code ec2, std::size_t) {
                             if (!ec2) {
-                                // ­pºâ³B²z¯Ó®É¡]·L¬í¡^
+                                // è¨ˆç®—è™•ç†è€—æ™‚ï¼ˆå¾®ç§’ï¼‰
                                 auto end = std::chrono::steady_clock::now();
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-                                // Àx¦s latency ²Î­p
+                                // å„²å­˜ latency çµ±è¨ˆ
                                 {
                                     std::lock_guard<std::mutex> lock(latency_mutex);
                                     latency_samples.push_back(static_cast<int>(duration_us));
                                 }
-                                self->do_read(); // §Î¦¨Åª¡÷¼g¡÷Åª´`Àô¡A¦^¼g¦¨¥\«áÄ~Äò¤U¤@½üÅª¨ú
+                                self->do_read(); // å½¢æˆè®€â†’å¯«â†’è®€å¾ªç’°ï¼Œå›å¯«æˆåŠŸå¾Œç¹¼çºŒä¸‹ä¸€è¼ªè®€å–
                             }
                             else {
-                                self->graceful_close(); //½T«OÄÀ©ñ»P­p¼Æ»¼´î¡C
+                                self->graceful_close(); //ç¢ºä¿é‡‹æ”¾èˆ‡è¨ˆæ•¸éæ¸›ã€‚
                             }
                         });
                 }
                 else {
-                    self->graceful_close(); //½T«OÄÀ©ñ»P­p¼Æ»¼´î¡C
+                    self->graceful_close(); //ç¢ºä¿é‡‹æ”¾èˆ‡è¨ˆæ•¸éæ¸›ã€‚
                 }
             });
     }
 
-    //tcp::socket socket_;    //client ªº TCP socket
+    //tcp::socket socket_;    //client çš„ TCP socket
     enum { max_length = 1024 };
-    char data_[max_length];     // ±µ¦¬½w½Ä°Ï
+    char data_[max_length];     // æ¥æ”¶ç·©è¡å€
     boost::asio::ssl::stream<tcp::socket> ssl_stream_;
 
-    bool handshake_ok_ = false;       // ´¤¤â¬O§_¦¨¥\
-    bool armed_tcp_ = false;          // ¬O§_¤w¥[ active_tcp_connections
-    bool armed_tls_ = false;          // ¬O§_¤w¥[ active_tls_connections
-    std::atomic<bool> closed_{ false }; //graceful_close ¨¾¤î¦h¦¸Ãö³¬
+    bool handshake_ok_ = false;       // æ¡æ‰‹æ˜¯å¦æˆåŠŸ
+    bool armed_tcp_ = false;          // æ˜¯å¦å·²åŠ  active_tcp_connections
+    bool armed_tls_ = false;          // æ˜¯å¦å·²åŠ  active_tls_connections
+    std::atomic<bool> closed_{ false }; //graceful_close é˜²æ­¢å¤šæ¬¡é—œé–‰
 };
 
-// Server Ãş§O¡G­t³dºÊÅ¥¡B±µ¨ü³s½u¡B²Î­p»PÃö³¬¬yµ{
+// Server é¡åˆ¥ï¼šè² è²¬ç›£è½ã€æ¥å—é€£ç·šã€çµ±è¨ˆèˆ‡é—œé–‰æµç¨‹
 class Server {
 public:
     Server(boost::asio::io_context& io_context, tcp::endpoint endpoint, boost::asio::ssl::context& ssl_ctx)
@@ -174,7 +175,7 @@ public:
         stats_timer_(io_context),
         signals_(io_context, SIGINT, SIGTERM) {
 
-        // ¤â°Ê open/bind/listen
+        // æ‰‹å‹• open/bind/listen
         boost::system::error_code ec;
         acceptor_.open(endpoint.protocol(), ec);
         if (ec) throw std::runtime_error("acceptor open failed: " + ec.message());
@@ -189,35 +190,36 @@ public:
         if (ec) std::cerr << "[Server] listen failed: " << ec.message() << "\n";
 
 
-        start_accept();      // ±Ò°Ê«D¦P¨B±µ¨ü³s½u
-        start_stats();       // ±Ò°Ê²Î­p­p®É¾¹
-        start_signal_wait(); // ±Ò°Ê°T¸¹ºÊÅ¥
+        start_accept();      // å•Ÿå‹•éåŒæ­¥æ¥å—é€£ç·š
+        start_stats();       // å•Ÿå‹•çµ±è¨ˆè¨ˆæ™‚å™¨
+        start_signal_wait(); // å•Ÿå‹•è¨Šè™Ÿç›£è½
     }
 
 private:
     void start_accept() {
-        //«D¦P¨B±µ¨ü·s³s½u¡A¨C¦¸«Ø¥ß·s socket¡AÁ×§K­«½Æ¨Ï¥Î
+        //éåŒæ­¥æ¥å—æ–°é€£ç·šï¼Œæ¯æ¬¡å»ºç«‹æ–° socketï¼Œé¿å…é‡è¤‡ä½¿ç”¨
         auto session = std::make_shared<Session>(io_context_, ssl_ctx_);
-        auto& socket = session->stream().lowest_layer(); // ¨ú±o©³¼h TCP socket
+        auto& socket = session->stream().lowest_layer(); // å–å¾—åº•å±¤ TCP socket
 
         acceptor_.async_accept(socket,
             [this, session](boost::system::error_code ec) {
                 if (!ec) {
-                    total_connections++; //²Î­p©Ò¦³³s½u¹Á¸Õ(¤£½×¬O§_¦¨¥\´¤¤â)
+                    total_connections++; //çµ±è¨ˆæ‰€æœ‰é€£ç·šå˜—è©¦(ä¸è«–æ˜¯å¦æˆåŠŸæ¡æ‰‹)
 
-                     // «Ø¥ß Session ³B²z¸Ó³s½u¡A±Ò°Ê TLS sessio
+                     // å»ºç«‹ Session è™•ç†è©²é€£ç·šï¼Œå•Ÿå‹• TLS sessio
                     session->start();
 
                 }
                 else {
                     std::cerr << "[Server] Accept failed: " << ec.message() << "\n";
                 }
-                start_accept(); // µL±ø¥ó»¼°j©I¥s¡A«ùÄò±µ¨ü¤U¤@±ø³s½u
+                start_accept(); // ç„¡æ¢ä»¶éè¿´å‘¼å«ï¼ŒæŒçºŒæ¥å—ä¸‹ä¸€æ¢é€£ç·š
             });
     }
 
-    // ¨C¬í¿é¥X²Î­p¸ê°T¡]¬¡ÅD³s½u¡BQPS¡B©Úµ´¼Æ¡^
+    // æ¯ç§’è¼¸å‡ºçµ±è¨ˆè³‡è¨Šï¼ˆæ´»èºé€£ç·šã€QPSã€æ‹’çµ•æ•¸ï¼‰
     void start_stats() {
+
         stats_timer_.expires_after(std::chrono::seconds(1));
         stats_timer_.async_wait([this](boost::system::error_code ec) {
             if (!ec) {
@@ -225,15 +227,23 @@ private:
                     << " | QPS:" << messages_processed
                     << " | Rejected:" << rejected_connections << "\n";*/
 
-                    // ­pºâ¥­§¡ latency¡]·L¬í¡^
+                    // è¨ˆç®—å¹³å‡ latencyï¼ˆå¾®ç§’ï¼‰
                 int avg_latency = 0;
+                int p95_latency = 0;
+                int p99_latency = 0;
                 {
                     std::lock_guard<std::mutex> lock(latency_mutex);
                     if (!latency_samples.empty()) {
-                        int total = 0;
-                        for (int v : latency_samples) total += v;
-                        avg_latency = total / static_cast<int>(latency_samples.size());
-                        latency_samples.clear(); // ¨C¬í²MªÅ¡AÁ×§K²Ö¿n
+                        std::sort(latency_samples.begin(), latency_samples.end());
+
+                        int total = static_cast<int>(latency_samples.size());
+                        int sum = 0;
+                        for (int v : latency_samples) sum += v;
+                        avg_latency = sum / total;
+
+                        p95_latency = latency_samples[total * 95 / 100];
+                        p99_latency = latency_samples[total * 99 / 100];
+                        latency_samples.clear(); // æ¯ç§’æ¸…ç©ºï¼Œé¿å…ç´¯ç©
                     }
                 }
                 /*
@@ -242,30 +252,33 @@ private:
                     << " | Rejected: " << rejected_connections
                     << " | Avg latency: " << avg_latency << "us\n";
                 */
-                std::cout << "[Server] Active TLS connections: " << active_tls_connections
-                    << " | Active TCP connections: " << active_tcp_connections
-                    << " | Total connections: " << total_connections
-                    << " | Messages processed: " << messages_processed
+                std::cout << "[Server] Active TLS: " << active_tls_connections
+                    << " | TCP: " << active_tcp_connections
+                    << " | Total: " << total_connections
+                    << " | QPS: " << messages_processed
                     << " | Rejected: " << rejected_connections
-                    << " | Avg latency: " << avg_latency << "us\n";
+                    << " | Avg: " << avg_latency << "us"
+                    << " | P95: " << p95_latency << "us"
+                    << " | P99: " << p99_latency << "us\n";
 
-                messages_processed = 0; // ¨C¬í­«³] QPS ²Î­p
-                start_stats();          // ¦A¦¸±Æµ{¤U¤@¦¸²Î­p
+
+                messages_processed = 0; // æ¯ç§’é‡è¨­ QPS çµ±è¨ˆ
+                start_stats();          // å†æ¬¡æ’ç¨‹ä¸‹ä¸€æ¬¡çµ±è¨ˆ
             }
             });
     }
 
-    // ºÊÅ¥ SIGINT/SIGTERM
+    // ç›£è½ SIGINT/SIGTERM
     void start_signal_wait() {
         signals_.async_wait([this](boost::system::error_code ec, int signal_number) {
             if (!ec) {
                 std::cout << "\n[Server] Caught signal " << signal_number << ", shutting down...\n";
 
-                // ¦w¥şÃö³¬¬yµ{
+                // å®‰å…¨é—œé–‰æµç¨‹
                 boost::system::error_code ignore_ec;
-                acceptor_.close(ignore_ec); // °±¤î±µ¨ü·s³s½u
-                stats_timer_.cancel();     // °±¤î²Î­p­p®É¾¹
-                io_context_.stop();        // °±¤î¨Æ¥ó°j°é
+                acceptor_.close(ignore_ec); // åœæ­¢æ¥å—æ–°é€£ç·š
+                stats_timer_.cancel();     // åœæ­¢çµ±è¨ˆè¨ˆæ™‚å™¨
+                io_context_.stop();        // åœæ­¢äº‹ä»¶è¿´åœˆ
             }
             });
     }
@@ -283,17 +296,17 @@ int main() {
         boost::asio::io_context io;
 
         //TLS 1.3 boost
-        //«Ø¥ßTLS context
+        //å»ºç«‹TLS context
         
         boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_server);
-        //1. ¸ü¤JServerªº¾ÌÃÒ»P¨pÆ_
+        //1. è¼‰å…¥Serverçš„æ†‘è­‰èˆ‡ç§é‘°
         ssl_ctx.use_certificate_chain_file("../../../server-certs/public/server.crt");
         ssl_ctx.use_private_key_file("../../../server-certs/private/server.key", boost::asio::ssl::context::pem);
 
-        //2. ³]©wÅçÃÒ¼Ò¦¡:­n¨Dclient´£¨Ñ¾ÌÃÒ¡A¨Ã±j¨îÅçÃÒ
+        //2. è¨­å®šé©—è­‰æ¨¡å¼:è¦æ±‚clientæä¾›æ†‘è­‰ï¼Œä¸¦å¼·åˆ¶é©—è­‰
         ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
         
-        // 3. ¸ü¤J CA ¾ÌÃÒ¡G¥Î¨ÓÅçÃÒ client ªº¾ÌÃÒ¬O§_¥Ñ«H¥ôªº CA Ã±µo
+        // 3. è¼‰å…¥ CA æ†‘è­‰ï¼šç”¨ä¾†é©—è­‰ client çš„æ†‘è­‰æ˜¯å¦ç”±ä¿¡ä»»çš„ CA ç°½ç™¼
         ssl_ctx.load_verify_file("../../../CA/ca.pem");
 
         tcp::endpoint endpoint(tcp::v4(), 12345);
@@ -301,9 +314,9 @@ int main() {
 
 
 
-        // «Ø¥ß thread pool ³B²z io_context ªº¨Æ¥ó¡A¥i©T©w thread ¼Æ¡]¨Ò¦p 8 ©Î 16¡^¥H§QÀ£´ú¤@­P©Ê
+        // å»ºç«‹ thread pool è™•ç† io_context çš„äº‹ä»¶ï¼Œå¯å›ºå®š thread æ•¸ï¼ˆä¾‹å¦‚ 8 æˆ– 16ï¼‰ä»¥åˆ©å£“æ¸¬ä¸€è‡´æ€§
         /*unsigned int thread_count = std::thread::hardware_concurrency();*/
-        unsigned int thread_count = 8;
+        unsigned int thread_count = 16;
         std::vector<std::thread> threads;
         for (unsigned int i = 0; i < thread_count; i++) {
             threads.emplace_back([&io]() { io.run(); });
@@ -313,6 +326,8 @@ int main() {
     catch (std::exception& e) {
         std::cerr << "Server exception: " << e.what() << "\n";
     }
+
+    system("pause");
 
     return 0;
 }
