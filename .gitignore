@@ -8,7 +8,7 @@ certs/private/*.key
 
 # 憑證簽署請求（非必要）
 certs/csr/*.csr
-certs/csr/*.crt
+certs/public/*.crt
 client-certs/csr/
 client-certs/private/
 client-certs/public/
