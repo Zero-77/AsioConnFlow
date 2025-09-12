@@ -297,10 +297,10 @@ int main() {
         ssl_ctx.use_private_key_file("../../../server-certs/private/server.key", boost::asio::ssl::context::pem);
 
         //2. 設定驗證模式:要求client提供憑證，並強制驗證
-        //ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
+        ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
         
         // 3. 載入 CA 憑證：用來驗證 client 的憑證是否由信任的 CA 簽發
-        //ssl_ctx.load_verify_file("../../../CA/ca.pem");
+        ssl_ctx.load_verify_file("../../../CA/ca.pem");
 
         tcp::endpoint endpoint(tcp::v4(), 12345);
         Server server(io, endpoint, ssl_ctx);

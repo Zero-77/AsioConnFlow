@@ -7,14 +7,21 @@ TCP 非阻塞伺服器
 
 目前功能:
 
-  - 5,000 並發連線穩定 (所有 client 成功連線並進入循環)
+  - 7,000 並發連線穩定 (所有 client 成功連線並進入循環)
 
-  - 5,000 QPS 持續輸出，95%/99% (server 每秒處理 30,000+ 筆訊息)
-
-  (Client累積了 500 筆 latency 資料，就觸發一次平均值輸出，目前平均值 26ms)
+  - 7,000 QPS 持續輸出，95%/99% (server 每秒處理 10,000+ 筆訊息)
 
 
 計算公式:
   - latency = 收到 Echo 回覆 的時間 - 送出訊息 的時間
     
-  - Avg = (所有 latency 加總) ÷ 500筆
+
+
+相關憑證路徑: (請自行放入)
+- client-certs/private/client.key
+- client-certs/public/client.crt
+
+- server-certs/private/server.key
+- server-certs/public/server.crt
+
+- CA/ca.pem

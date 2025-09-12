@@ -521,7 +521,7 @@ int main() {
     
     //發送 瞬間併發連線
     std::vector<std::thread> threads;
-    for (int i = 0; i < 7700; i++) {
+    for (int i = 0; i < 7000; i++) {
         threads.emplace_back([&, i]() {
             auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal, all_latencies);
             client->start_with_retry();
