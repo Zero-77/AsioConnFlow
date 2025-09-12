@@ -8,6 +8,13 @@ certs/private/*.key
 
 # 憑證簽署請求（非必要）
 certs/csr/*.csr
+client-certs/csr/
+client-certs/private/
+client-certs/public/
+server-certs/csr/
+server-certs/private/
+server-certs/public/
+CA/
 
 
 # User-specific files
