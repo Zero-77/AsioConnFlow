@@ -60,9 +60,8 @@ void record_qps(std::atomic<bool>& stop_flag) {
 }
 
 
-
-
 BOOLEAN behavior_test = FALSE; //模擬連線行為開關
+
 
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
 class SimulatedClient : public std::enable_shared_from_this<SimulatedClient> {
@@ -472,95 +471,150 @@ private:
 };
 
 int main() {
-    std::srand(static_cast<unsigned int>(std::time(nullptr))); // 初始化隨機種子
-
-    boost::asio::io_context io;
-
-
-    // 加入 signal_set 來攔截 Ctrl+C
-    boost::asio::signal_set signals(io, SIGINT);
-    signals.async_wait([&](boost::system::error_code /*ec*/, int /*signo*/) {
-        std::cout << "\n[Client] Ctrl+C detected. Shutting down gracefully...\n";
-        stop_requested.store(true);
-        stop_qps_monitor.store(true);
-        io.stop(); // 這是關鍵，讓 io.run() 結束
-    });
-
-
-    tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 12345); // server 端點
-
-    //TLS 1.3 boost
-    //建立TLS context
-    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
-    //ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none); //測試用，不驗證對方，直接接受任何憑證
-
-    //1. 驗證 Server憑證(由CA簽發)
-    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
-    ssl_ctx.load_verify_file("../../../CA/ca.pem"); // CA憑證: 用來驗證 server.crt
-
-    //2. 提供Client 的憑證與私鑰(由同一CA簽發)
-    ssl_ctx.use_certificate_chain_file("../../../client-certs/public/client.crt");
-    ssl_ctx.use_private_key_file("../../../client-certs/private/client.key", boost::asio::ssl::context::pem);
-
-    //計算
-    auto all_latencies = std::make_shared<std::vector<int>>();
-
-    // 模擬參數：可依壓測目標調整
-    /*
-    int total_clients = 5000;   // 總 client 數
-    int batch_size = 500;       // 每批啟動數量
-    int interval_ms = 100;      // 每批間隔時間（毫秒）
-    */
-
-    int total_clients = 300;   // 總 client 數
-    int batch_size = 100;       // 每批啟動數量
-    int interval_ms = 10000;      // 每批間隔時間（毫秒）
-
-    // 啟動批次啟動器
-    //std::make_shared<BatchLauncher>(io, endpoint, ssl_ctx, total_clients, batch_size, interval_ms)->start();
+    bool test_error_ssl = FALSE; //開/關 錯誤的憑證連線，開TRUE/關FALSE
     
-    //發送 瞬間併發連線
-    std::vector<std::thread> threads;
-    for (int i = 0; i < 7000; i++) {
-        threads.emplace_back([&, i]() {
-            auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal, all_latencies);
-            client->start_with_retry();
+    if (test_error_ssl) {
+        //取用錯誤的憑證進行連線
+        struct TestCase {
+            std::string name;
+            std::string cert_path;
+            std::string key_path;
+        };
+
+        std::vector<TestCase> test_cases = {
+            { "Expired", "../../../client-certs/public/test_error/expired.crt", "../../../client-certs/public/test_error/expired.key" },
+            { "NotYetValid", "../../../client-certs/public/test_error/notyet.crt", "../../../client-certs/public/test_error/notyet.key" },
+            { "SelfSigned", "../../../client-certs/public/test_error/selfsigned.crt", "../../../client-certs/public/test_error/selfsigned.key" },
+            { "UnknownCA", "../../../client-certs/public/test_error/badclient.crt", "../../../client-certs/public/test_error/badclient.key" },
+            { "wronghost", "../../../client-certs/public/test_error/wronghost.crt", "../../../client-certs/public/test_error/wronghost.key" }
+        };
+
+        for (const auto& test : test_cases) {
+            std::cout << "Testing: " << test.name << "\n";
+
+            boost::asio::io_context io;
+            boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
+
+            try {
+                ssl_ctx.use_certificate_chain_file(test.cert_path);
+                ssl_ctx.use_private_key_file(test.key_path, boost::asio::ssl::context::pem);
+                ssl_ctx.load_verify_file("../../../CA/ca.pem");
+                ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+
+                boost::asio::ssl::stream<boost::asio::ip::tcp::socket> ssl_stream(io, ssl_ctx);
+                boost::asio::ip::tcp::resolver resolver(io);
+                boost::system::error_code ec;
+                auto endpoints = resolver.resolve("127.0.0.1", "12345");
+
+                boost::asio::connect(ssl_stream.lowest_layer(), endpoints);
+                ssl_stream.handshake(boost::asio::ssl::stream_base::client, ec);
+
+                if (ec) {
+                    std::cerr << "TLS handshake failed: " << ec.message() << "\n";
+                }
+                else {
+                    std::cout << "TLS handshake succeeded---Note: handshake success does not imply certificate trust\n";
+                }
+            }
+            catch (const std::exception& ex) {
+                std::cout << "Handshake failed for " << test.name << ": " << ex.what() << "\n";
+            }
+
+            std::cout << "----------------------------------\n";
+        }
+    
+    }
+    else {
+        std::srand(static_cast<unsigned int>(std::time(nullptr))); // 初始化隨機種子
+
+        boost::asio::io_context io;
+
+
+        // 加入 signal_set 來攔截 Ctrl+C
+        boost::asio::signal_set signals(io, SIGINT);
+        signals.async_wait([&](boost::system::error_code /*ec*/, int /*signo*/) {
+            std::cout << "\n[Client] Ctrl+C detected. Shutting down gracefully...\n";
+            stop_requested.store(true);
+            stop_qps_monitor.store(true);
+            io.stop(); // 這是關鍵，讓 io.run() 結束
             });
+
+
+        tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 12345); // server 端點
+
+        //TLS 1.3 boost
+        //建立TLS context
+        boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv13_client);
+        //ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none); //測試用，不驗證對方，直接接受任何憑證
+
+        //1. 驗證 Server憑證(由CA簽發)
+        ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+        ssl_ctx.load_verify_file("../../../CA/ca.pem"); // CA憑證: 用來驗證 server.crt
+
+        //2. 提供Client 的憑證與私鑰(由同一CA簽發)
+        ssl_ctx.use_certificate_chain_file("../../../client-certs/public/client.crt");
+        ssl_ctx.use_private_key_file("../../../client-certs/private/client.key", boost::asio::ssl::context::pem);
+
+        //計算
+        auto all_latencies = std::make_shared<std::vector<int>>();
+
+        // 模擬參數：可依壓測目標調整
+        /*
+        int total_clients = 5000;   // 總 client 數
+        int batch_size = 500;       // 每批啟動數量
+        int interval_ms = 100;      // 每批間隔時間（毫秒）
+        */
+
+        int total_clients = 300;   // 總 client 數
+        int batch_size = 100;       // 每批啟動數量
+        int interval_ms = 10000;      // 每批間隔時間（毫秒）
+
+        // 啟動批次啟動器
+        //std::make_shared<BatchLauncher>(io, endpoint, ssl_ctx, total_clients, batch_size, interval_ms)->start();
+
+        //發送 瞬間併發連線
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 10000; i++) {
+            threads.emplace_back([&, i]() {
+                auto client = std::make_shared<SimulatedClient>(io, i, endpoint, ssl_ctx, ClientMode::Normal, all_latencies);
+                client->start_with_retry();
+                });
+        }
+        for (auto& t : threads) t.join();
+
+        //io.run(); // 啟動事件迴圈
+
+
+
+        try {
+
+            record_qps(stop_qps_monitor); // 啟動即時 QPS 顯示
+
+            io.run();  // 啟動事件迴圈
+
+            // 分析 latency 分佈
+            std::sort(all_latencies->begin(), all_latencies->end());
+
+            int total = all_latencies->size();
+            int p95 = all_latencies->at(total * 95 / 100);
+            int p99 = all_latencies->at(total * 99 / 100);
+            double avg = std::accumulate(all_latencies->begin(), all_latencies->end(), 0.0) / total;
+
+            std::cout << "\n=== Performance Summary ===\n";
+            std::cout << "Total Requests: " << total << "\n";
+            std::cout << "Average Latency: " << avg / 1000 << " ms\n";
+            std::cout << "P95 Latency: " << p95 / 1000 << " ms\n";
+            std::cout << "P99 Latency: " << p99 / 1000 << " ms\n";
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[Client] Exception caught: " << e.what() << "\n";
+        }
+
+        if (stop_requested.load()) {
+            std::cout << "[Client] Graceful shutdown complete. Press Enter to exit.\n";
+            std::cin.get();
+        }
     }
-    for (auto& t : threads) t.join();
-    
-    //io.run(); // 啟動事件迴圈
-
-    
-    
-    try {
-
-        record_qps(stop_qps_monitor); // 啟動即時 QPS 顯示
-
-       io.run();  // 啟動事件迴圈
-
-       // 分析 latency 分佈
-       std::sort(all_latencies->begin(), all_latencies->end());
-
-       int total = all_latencies->size();
-       int p95 = all_latencies->at(total * 95 / 100);
-       int p99 = all_latencies->at(total * 99 / 100);
-       double avg = std::accumulate(all_latencies->begin(), all_latencies->end(), 0.0) / total;
-
-       std::cout << "\n=== Performance Summary ===\n";
-       std::cout << "Total Requests: " << total << "\n";
-       std::cout << "Average Latency: " << avg / 1000 << " ms\n";
-       std::cout << "P95 Latency: " << p95 / 1000 << " ms\n";
-       std::cout << "P99 Latency: " << p99 / 1000 << " ms\n";
-    }
-    catch (const std::exception& e) {
-        std::cerr << "[Client] Exception caught: " << e.what() << "\n";
-    }
-
-    if (stop_requested.load()) {
-        std::cout << "[Client] Graceful shutdown complete. Press Enter to exit.\n";
-        std::cin.get();
-    }
-
+    system("pause");
     return 0;
 }

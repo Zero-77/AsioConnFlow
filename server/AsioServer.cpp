@@ -12,19 +12,19 @@
 using boost::asio::ip::tcp;
 
 // 提高最大連線數以符合壓測目標
-constexpr int MAX_CONNECTIONS = 10000;
+constexpr int MAX_CONNECTIONS = 11000;
 
-// 全域統計變數：追蹤總連線數、處理訊息數、拒絕連線數、TCP連線數、TLS連線數
+// 全域統計變數：追蹤總連線數、處理訊息數、拒絕連線數、TCP連線數、TLS連線數、thread處理QPS監控
 std::atomic<int> total_connections{ 0 };
 std::atomic<int> messages_processed{ 0 };
 std::atomic<int> rejected_connections{ 0 };
 std::atomic<int> active_tcp_connections{ 0 };
 std::atomic<int> active_tls_connections{ 0 };
+std::atomic<bool> stop_stats_thread{ false };
 
 // 效能統計和互斥鎖
 std::vector<int> latency_samples;    // 儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   // 保護 latency_samples 的存取
-
 
 // Session 類別：代表一個 client 連線，負責處理讀寫
 class Session : public std::enable_shared_from_this<Session> {
@@ -79,8 +79,14 @@ public:
                     self->do_read();
                 }
                 else {
-                    // TLS握手失敗處理
+                    // TLS握手、憑證驗證  失敗處理
                     std::cerr << "[Server] TLS handshake failed: " << ec.message() << "\n";
+                    rejected_connections++; // 拒絕連線數計數
+
+                    //拒絕連線處理，確保 socket 被關閉， client 收到錯誤訊號
+                    boost::system::error_code close_ec;
+                    self->stream().lowest_layer().close(close_ec);  // 執行關閉 socket 的動作 
+
                     self->graceful_close();
                 }
             });
@@ -193,7 +199,8 @@ public:
 
 
         start_accept();      // 啟動非同步接受連線
-        start_stats();       // 啟動統計計時器
+        //start_stats();       // 啟動統計計時器
+        start_stats_thread();
         start_signal_wait(); // 啟動訊號監聽:當接收到中斷訊號時進行清理或關閉伺服器
     }
 
@@ -208,7 +215,7 @@ private:
             [this, session](boost::system::error_code ec) {
                 if (!ec) {
                     total_connections++; //統計所有連線嘗試(不論是否成功握手)
-                    session->start();// 建立 Session 處理該連線，啟動 TLS sessio
+                    session->start();// 建立 Session 處理該連線，啟動 TLS session
 
                 }
                 else {
@@ -218,6 +225,7 @@ private:
             });
     }
 
+    /*
     // 每秒輸出統計資訊（活躍連線、QPS、拒絕數）
     void start_stats() {
 
@@ -261,6 +269,52 @@ private:
             }
             });
     }
+    */
+
+    //改用獨立的thread處理QPS統計，或是其他監控
+
+
+    void start_stats_thread() {
+        std::thread([this]() {
+            while (!stop_stats_thread.load()) {
+               
+
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+
+                int avg_latency = 0;
+                int p95_latency = 0;
+                int p99_latency = 0;
+
+                {
+                    std::lock_guard<std::mutex> lock(latency_mutex);
+                    if (!latency_samples.empty()) {
+                        std::sort(latency_samples.begin(), latency_samples.end());
+                        int total = static_cast<int>(latency_samples.size());
+                        int sum = 0;
+                        for (int v : latency_samples) sum += v;
+                        avg_latency = sum / total;
+                        p95_latency = latency_samples[total * 95 / 100];
+                        p99_latency = latency_samples[total * 99 / 100];
+                        latency_samples.clear();
+                    }
+                }
+
+                if (stop_stats_thread.load()) break;
+                std::cout << "[Server] Active TLS: " << active_tls_connections
+                    << " | TCP: " << active_tcp_connections
+                    << " | Total: " << total_connections
+                    << " | QPS: " << messages_processed
+                    << " | Rejected: " << rejected_connections
+                    << " | Avg: " << avg_latency << "us"
+                    << " | P95: " << p95_latency << "us"
+                    << " | P99: " << p99_latency << "us\n";
+
+                messages_processed = 0;
+            }
+            }).detach(); 
+    }
+
+
 
     // 監聽 SIGINT/SIGTERM
     void start_signal_wait() {
@@ -273,6 +327,9 @@ private:
                 acceptor_.close(ignore_ec); // 停止接受新連線
                 stats_timer_.cancel();     // 停止統計計時器
                 io_context_.stop();        // 停止事件迴圈
+
+                stop_stats_thread.store(true); // 停止thread用於QPS統計
+
             }
             });
     }
@@ -301,6 +358,37 @@ int main() {
         
         // 3. 載入 CA 憑證：用來驗證 client 的憑證是否由信任的 CA 簽發
         ssl_ctx.load_verify_file("../../../CA/ca.pem");
+
+        //4. 自訂驗證 callback
+        ssl_ctx.set_verify_callback([](bool preverified, boost::asio::ssl::verify_context& ctx) {
+            X509_STORE_CTX* store = ctx.native_handle();
+            int err = X509_STORE_CTX_get_error(store);
+            const char* msg = X509_verify_cert_error_string(err);
+
+            if (!preverified) {
+                std::cerr << "[TLS Verify] Failed: " << msg << "\n";
+                return false;  // 主動拒絕握手，傳送 fatal alert
+
+                switch (err) {
+                    case X509_V_ERR_CERT_HAS_EXPIRED:   //憑證已過期
+                        std::cerr << "Reason: expired cert\n"; 
+                        break;
+                    case X509_V_ERR_CERT_NOT_YET_VALID: //憑證尚未生效
+                        std::cerr << "Reason: not yet valid\n"; 
+                        break;  
+                    case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT:    //自簽憑證且不在信任清單
+                        std::cerr << "Reason: self-signed cert\n"; 
+                        break;   
+                    case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: //找不到簽發者憑證
+                        std::cerr << "Reason: unknown CA\n"; 
+                        break;
+                    default:
+                        std::cerr << "Reason: other TLS error\n"; 
+                        break;
+                }
+            }
+            return true;  // 驗證通過，繼續握手
+         });
 
         tcp::endpoint endpoint(tcp::v4(), 12345);
         Server server(io, endpoint, ssl_ctx);
