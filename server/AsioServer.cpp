@@ -124,7 +124,7 @@ private:
         auto self = shared_from_this();
 
         //Server設置idle timeout 機制，加入 讀取超時
-        read_deadline_.expires_after(std::chrono::seconds(30));  // 等待如  10 秒。測試10000筆連線，需等待handshake全部完成(25 秒)
+        read_deadline_.expires_after(std::chrono::seconds(30));  // 等待如  10 秒。測試瞬間10000筆連線，需等待handshake全部完成(25 秒)
         read_deadline_.async_wait([self](const boost::system::error_code& ec) {
             if (!ec) {
                 std::cerr << "[Session] Read timeout, terminating\n";
