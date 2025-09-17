@@ -29,10 +29,10 @@ TCP 非阻塞伺服器
   - active_tcp_connections = 成功建立 TCP socket 的連線數
   - active_tls_connections = 成功完成 TLS handshake 的連線數
   - rejected_connections = TLS handshake 失敗 + 超過 MAX_CONNECTIONS 而拒絕
-  - P95 / P99 latency：
-		P95：95% 的 request 在此時間內完成
-		P99：99% 的 request 在此時間內完成
-		計算方式：對所有 request latency 排序後取第 N 百分位
+  - P95 / P99 latency:
+	- P95：95% 的 request 在此時間內完成
+	- P99：99% 的 request 在此時間內完成
+	- 計算方式：對所有 request latency 排序後取第 N 百分位
  
 
 
