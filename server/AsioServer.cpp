@@ -8,6 +8,8 @@
 #include <atomic>
 #include <csignal>
 #include <chrono>
+#include <set>
+
 
 using boost::asio::ip::tcp;
 
@@ -26,14 +28,20 @@ std::atomic<bool> stop_stats_thread{ false };
 std::vector<int> latency_samples;    // 儲存每筆處理耗時（微秒）
 std::mutex latency_mutex;   // 保護 latency_samples 的存取
 
+class Server;
+
 // Session 類別：代表一個 client 連線，負責處理讀寫
 class Session : public std::enable_shared_from_this<Session> {
 public:
     // Session 類別的建構子:負責初始化 SSL 流物件 ssl_stream_，並綁定底層的 io_context 和 SSL context
     // io_context: 負責管理所有非同步 I/O 操作的事件循環
     // ssl_ctx: 用於設定 SSL/TLS 參數（憑證、私鑰、加密套件等）
-    Session(boost::asio::io_context& io_context, boost::asio::ssl::context& ssl_ctx)
-        : ssl_stream_(io_context, ssl_ctx)  { 
+    Session(boost::asio::io_context& io_context, boost::asio::ssl::context& ssl_ctx, Server& server) : 
+        ssl_stream_(io_context, ssl_ctx),       // 初始化 TLS 封裝的 socket，使用 io_context 與 SSL context
+        server_ref_(server),                    // 儲存 Server 參照，用於回報連線狀態與移除 Session
+        read_deadline_(io_context)              // 初始化讀取超時計時器，用於 idle timeout 控制
+    {  
+
     }
     
     // 取得底層的 ssl_stream_ 物件的引用，以便外部存取，如讀寫資料或關閉連線
@@ -44,10 +52,10 @@ public:
     // Session結束時，自動更新 TCP/TLS 連線的統計數量，確保系統目前有的活躍連線
     ~Session() {
         // armed_tcp_ bool表示這個 Session 是否曾使用過 TCP
-        if (armed_tcp_) active_tcp_connections--;
+        //if (armed_tcp_) active_tcp_connections--;
 
         // armed_tls_ bool表示這個 Session 是否曾使用過 TCP
-        if (armed_tls_) active_tls_connections--;
+        //if (armed_tls_) active_tls_connections--;
     }
 
     void start() {
@@ -64,9 +72,10 @@ public:
                         boost::system::error_code close_ec;
 
                         //拒絕連線處理
-                        self->stream().lowest_layer().close(close_ec);  // 執行關閉 socket 的動作            
+                        //self->stream().lowest_layer().close(close_ec);  // 執行關閉 socket 的動作            
                         std::cout << "[Server] TLS handshake rejected (limit reached)\n";
                         rejected_connections++;    // 拒絕連線數計數
+                        self->terminate(); // 關閉與釋放
                         return; // 直接返回，未建立armed_tls_維持false、不計數active_tls_connections
                     }
 
@@ -84,32 +93,48 @@ public:
                     rejected_connections++; // 拒絕連線數計數
 
                     //拒絕連線處理，確保 socket 被關閉， client 收到錯誤訊號
-                    boost::system::error_code close_ec;
-                    self->stream().lowest_layer().close(close_ec);  // 執行關閉 socket 的動作 
+                    //boost::system::error_code close_ec;
+                    //self->stream().lowest_layer().close(close_ec);  // 執行關閉 socket 的動作 
+                    //self->graceful_close();
 
-                    self->graceful_close();
+                    self->terminate();  // 關閉與釋放
                 }
             });
     }
 
     void graceful_close() {
-        if (closed_.exchange(true)) return; // 防重入Reentrancy Guard
+        // if (closed_.exchange(true)) return; // 防重入Reentrancy Guard
 
         boost::system::error_code ec;
         if (handshake_ok_) {
             ssl_stream_.shutdown(ec); // 送出 TLS 協定 close_notify
+            if (ec) {
+                std::cerr << "[Session] TLS shutdown failed: " << ec.message() << "\n"; //若client端自行終止程式，錯誤訊息 : 連線已被您主機上的軟體中止。
+            }
         }
         //針對底層的 TCP 連線進行關閉
         ssl_stream_.lowest_layer().shutdown(tcp::socket::shutdown_both, ec); //shutdown_both 雙向傳輸，同時關閉 讀取和寫入
         ssl_stream_.lowest_layer().close(ec);
     }
 
+
 private:
     // 非同步讀取 client 資料
     void do_read() {
         auto self = shared_from_this();
+
+        //Server設置idle timeout 機制，加入 讀取超時
+        read_deadline_.expires_after(std::chrono::seconds(30));  // 等待如  10 秒。測試10000筆連線，需等待handshake全部完成(25 秒)
+        read_deadline_.async_wait([self](const boost::system::error_code& ec) {
+            if (!ec) {
+                std::cerr << "[Session] Read timeout, terminating\n";
+                self->terminate();  // 清理 zombie session
+            }
+            });
+
         ssl_stream_.async_read_some(boost::asio::buffer(data_),
             [self](boost::system::error_code ec, std::size_t length) {
+                self->read_deadline_.cancel();  // Client有傳資料就取消 timeout
                 if (!ec) {
                     messages_processed++; // 成功處理一筆訊息計數
 
@@ -133,12 +158,18 @@ private:
                                 self->do_read(); // 形成讀→寫→讀循環，回寫成功後繼續下一輪讀取
                             }
                             else { //若寫入失敗後釋放資源
-                                self->graceful_close(); //確保釋放與計數遞減。
+                                //self->graceful_close(); //確保釋放
+                                //std::cerr << "[Session] Write error: " << ec2.message() << "\n";
+                                self->terminate();  // 呼叫greceful_close() 和 計數遞減
+                                return;
                             }
                         });
                 }
                 else {  //若讀取錯誤後，回應錯誤並關閉連線
-                    self->graceful_close(); //確保釋放與計數遞減。
+                    //self->graceful_close(); //確保釋放
+                    //std::cerr << "[Session] Read error: " << ec.message() << "\n";
+                    self->terminate();  // 呼叫greceful_close() 和 計數遞減
+                    return;
                 }
             });
     }
@@ -151,6 +182,10 @@ private:
     bool armed_tcp_ = false;          // 標記 TCP 連線是否已加入連線計數
     bool armed_tls_ = false;          // 標記 TLS 連線是否已加入連線計數
     std::atomic<bool> closed_{ false }; //graceful_close 防止多次關閉
+
+    Server& server_ref_;
+    void terminate();
+    boost::asio::steady_timer read_deadline_; // 為讀取超時，新增steady_timer類別read_deadline_
 };
 
 // Server 類別：負責監聽、接受連線、統計與關閉流程
@@ -204,12 +239,20 @@ public:
         start_signal_wait(); // 啟動訊號監聽:當接收到中斷訊號時進行清理或關閉伺服器
     }
 
+    void remove_session(std::shared_ptr<Session> session) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        active_sessions_.erase(session);
+    }
     
 private:
     void start_accept() {
         //非同步接受新連線，每次建立新 Socket，避免重複使用
-        auto session = std::make_shared<Session>(io_context_, ssl_ctx_);
+        auto session = std::make_shared<Session>(io_context_, ssl_ctx_, *this);
         auto& socket = session->stream().lowest_layer(); // 取得底層 TCP Socket
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            active_sessions_.insert(session);   // 建立 Session 並累積
+        }
 
         acceptor_.async_accept(socket,
             [this, session](boost::system::error_code ec) {
@@ -334,12 +377,31 @@ private:
             });
     }
 
+
     tcp::acceptor acceptor_;    //TCP 監聽器，監聽指定的端點（IP + port）
     boost::asio::io_context& io_context_;   //管理所有非同步操作
     boost::asio::steady_timer stats_timer_; //定時器，週期性觸發每秒輸出統計資訊
     boost::asio::signal_set signals_;   //監聽系統訊號（例如 SIGINT、SIGTERM）: 關閉伺服器或做清理工作
     boost::asio::ssl::context& ssl_ctx_;     //建立安全的 SSL/TLS 連線，以是引用方式傳入:SSL/TLS 的上下文物件，儲存憑證、私鑰、加密演算法設定
+    
+    std::set<std::shared_ptr<Session>> active_sessions_;  // 追蹤活躍 Session
+    std::mutex session_mutex_;                            // 保護 active_sessions_
 };
+
+//Session::terminate有使用Server類別，其實作位置，放在 Server 類別定義之後
+void Session::terminate() {
+    if (closed_.exchange(true)) return;
+
+    graceful_close();
+
+    if (armed_tls_) {
+        active_tls_connections--;
+    }
+    if (armed_tcp_) {
+        active_tcp_connections--;
+    }
+    server_ref_.remove_session(shared_from_this());  // Server 類型已定義，釋放 Session shared_ptr
+}
 
 int main() {
     try {
