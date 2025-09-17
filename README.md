@@ -36,7 +36,7 @@ TCP 非阻塞伺服器
  
 
 
-相關憑證路徑: (請自行放入)
+相關憑證路徑: (請自行建立資料夾放入)
 - client-certs/private/client.key
 - client-certs/public/client.crt
 
@@ -45,7 +45,7 @@ TCP 非阻塞伺服器
 
 - CA/ca.pem
 
-錯誤憑證 模擬路徑: (請自行放入)
+錯誤憑證 路徑: (請自行建立資料夾放入)
 - client-certs/public/test_error/expired.crt
 - client-certs/public/test_error/expired.key
 - client-certs/public/test_error/notyet.crt
