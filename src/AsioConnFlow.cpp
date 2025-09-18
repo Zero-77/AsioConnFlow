@@ -619,7 +619,6 @@ int main() {
             std::cin.get();
         }
     }
-    int ret = system("pause");
 
     return 0;
 }

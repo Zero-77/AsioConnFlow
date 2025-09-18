@@ -473,7 +473,7 @@ int main() {
         std::cerr << "Server exception: " << e.what() << "\n";
     }
 
-    int ret = system("pause");
+    std::cin.get();
 
     return 0;
 }
