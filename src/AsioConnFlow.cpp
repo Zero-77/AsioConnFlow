@@ -10,6 +10,7 @@
 #include <random>
 #include <numeric>
 #include <csignal>
+#include <thread>
 
 
 
@@ -60,7 +61,7 @@ void record_qps(std::atomic<bool>& stop_flag) {
 }
 
 
-BOOLEAN behavior_test = FALSE; //模擬連線行為開關
+bool behavior_test = false; //模擬連線行為開關
 
 
 // 模擬一個 TCP client，負責連線、送出 ID、持續發送訊息
@@ -195,7 +196,7 @@ public:
         });
     }
 
-    void SimulatedClient::schedule_retry(int next_attempt) {
+    void schedule_retry(int next_attempt) {
         const int delay = retry_policy_.delay_for(next_attempt, rng_);
         std::cout << "[Client] Scheduling retry #" << next_attempt << " in " << delay << "ms\n";
 
@@ -217,7 +218,7 @@ public:
         });
     }
 
-    void SimulatedClient::reset_connection() {
+    void reset_connection() {
         boost::system::error_code ec;
 
         boost::asio::io_context io;
@@ -230,10 +231,13 @@ public:
         ssl_stream_.lowest_layer().close(ec);
 
         // 重新建立 TLS stream（避免 socket 泄漏）
-        ssl_stream_ = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>(io, ssl_ctx);
+        //ssl_stream_ = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>(io, ssl_ctx);
+        std::unique_ptr<boost::asio::ssl::stream<tcp::socket>> ssl_stream_;// 使用智能指標 來賦值
+        ssl_stream_ = std::make_unique<boost::asio::ssl::stream<tcp::socket>>(io, ssl_ctx);
+
 
         // 設定主機名驗證（SNI + CN/SAN）
-        SSL* ssl = ssl_stream_.native_handle();
+        SSL* ssl = ssl_stream_->native_handle();
         SSL_set_tlsext_host_name(ssl, "localhost");
         SSL_set1_host(ssl, "localhost");
     }
@@ -433,7 +437,7 @@ private:
 
         for (int i = 0; i < batch_size_ && launched_ < total_clients_; i++) {
             ClientMode mode = ClientMode::Normal;   //可以設定Client端連線模式Normal、EarlyClose、Idle、RST、NoTLS
-            if(behavior_test == TRUE) {
+            if(behavior_test == true) {
                 if (launched_ % 10 == 0) mode = ClientMode::EarlyClose;
                 else if (launched_ % 15 == 0) mode = ClientMode::Idle;
                 else if (launched_ % 20 == 0) mode = ClientMode::RST;
@@ -471,7 +475,7 @@ private:
 };
 
 int main() {
-    bool test_error_ssl = FALSE; //開/關 錯誤的憑證連線，開TRUE/關FALSE
+    bool test_error_ssl = false; //開/關 錯誤的憑證連線，開true /關false
     
     if (test_error_ssl) {
         //取用錯誤的憑證進行連線
@@ -615,6 +619,7 @@ int main() {
             std::cin.get();
         }
     }
-    system("pause");
+    int ret = system("pause");
+
     return 0;
 }

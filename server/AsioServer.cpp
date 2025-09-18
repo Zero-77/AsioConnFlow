@@ -155,7 +155,7 @@ private:
                                     std::lock_guard<std::mutex> lock(latency_mutex);
                                     latency_samples.push_back(static_cast<int>(duration_us));
                                 }
-                                self->do_read(); // 形成讀→寫→讀循環，回寫成功後繼續下一輪讀取
+                                self->do_read(); // 形成讀=>寫=>讀循環，回寫成功後繼續下一輪讀取
                             }
                             else { //若寫入失敗後釋放資源
                                 //self->graceful_close(); //確保釋放
@@ -378,7 +378,7 @@ private:
     }
 
 
-    tcp::acceptor acceptor_;    //TCP 監聽器，監聽指定的端點（IP + port）
+    tcp::acceptor acceptor_;    //TCP 監聽器，監聽指定的端點(IP + port)
     boost::asio::io_context& io_context_;   //管理所有非同步操作
     boost::asio::steady_timer stats_timer_; //定時器，週期性觸發每秒輸出統計資訊
     boost::asio::signal_set signals_;   //監聽系統訊號（例如 SIGINT、SIGTERM）: 關閉伺服器或做清理工作
@@ -473,7 +473,7 @@ int main() {
         std::cerr << "Server exception: " << e.what() << "\n";
     }
 
-    system("pause");
+    int ret = system("pause");
 
     return 0;
 }
